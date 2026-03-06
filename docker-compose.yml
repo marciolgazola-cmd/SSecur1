@@ -1,0 +1,15 @@
+version: "3.9"
+
+services:
+  ssecur1:
+    image: python:3.11-slim
+    container_name: ssecur1_app
+    working_dir: /app
+    volumes:
+      - ./:/app
+    ports:
+      - "3000:3000"
+    command: >
+      bash -c "pip install --no-cache-dir -r requirements.txt && reflex run --env prod --frontend-port 3000 --backend-port 8000"
+    environment:
+      - PYTHONUNBUFFERED=1
