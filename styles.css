@@ -41,6 +41,14 @@
   --field-border-strong: rgba(123, 115, 154, 0.62);
   --field-focus-ring: rgba(123, 115, 154, 0.18);
   --field-placeholder: #7a8798;
+  --kanban-column-bg: linear-gradient(180deg, rgba(255, 255, 255, 0.84) 0%, rgba(246, 248, 252, 0.96) 100%);
+  --kanban-column-shadow: 0 18px 34px rgba(148, 163, 184, 0.14);
+  --kanban-card-bg: rgba(255, 255, 255, 0.88);
+  --kanban-card-border: rgba(148, 163, 184, 0.22);
+  --kanban-card-shadow: 0 14px 28px rgba(148, 163, 184, 0.12);
+  --kanban-card-hover-bg: rgba(255, 250, 245, 0.96);
+  --kanban-card-hover-border: rgba(255, 122, 47, 0.34);
+  --kanban-card-hover-shadow: 0 22px 36px rgba(255, 122, 47, 0.16);
 }
 
 .theme-dark {
@@ -82,6 +90,14 @@
   --field-border-strong: rgba(181, 167, 227, 0.72);
   --field-focus-ring: rgba(181, 167, 227, 0.28);
   --field-placeholder: #94a3b8;
+  --kanban-column-bg: linear-gradient(180deg, rgba(26, 34, 52, 0.94) 0%, rgba(18, 24, 38, 0.98) 100%);
+  --kanban-column-shadow: 0 22px 38px rgba(0, 0, 0, 0.3);
+  --kanban-card-bg: rgba(30, 39, 59, 0.92);
+  --kanban-card-border: rgba(148, 163, 184, 0.18);
+  --kanban-card-shadow: 0 16px 28px rgba(0, 0, 0, 0.24);
+  --kanban-card-hover-bg: rgba(36, 47, 69, 0.96);
+  --kanban-card-hover-border: rgba(255, 122, 47, 0.4);
+  --kanban-card-hover-shadow: 0 22px 38px rgba(0, 0, 0, 0.32);
 }
 
 .theme-light {
