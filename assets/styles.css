@@ -41,6 +41,14 @@
   --field-border-strong: rgba(123, 115, 154, 0.62);
   --field-focus-ring: rgba(123, 115, 154, 0.18);
   --field-placeholder: #7a8798;
+  --kanban-column-bg: linear-gradient(180deg, rgba(255, 255, 255, 0.84) 0%, rgba(246, 248, 252, 0.96) 100%);
+  --kanban-column-shadow: 0 18px 34px rgba(148, 163, 184, 0.14);
+  --kanban-card-bg: rgba(255, 255, 255, 0.88);
+  --kanban-card-border: rgba(148, 163, 184, 0.22);
+  --kanban-card-shadow: 0 14px 28px rgba(148, 163, 184, 0.12);
+  --kanban-card-hover-bg: rgba(255, 250, 245, 0.96);
+  --kanban-card-hover-border: rgba(255, 122, 47, 0.34);
+  --kanban-card-hover-shadow: 0 22px 36px rgba(255, 122, 47, 0.16);
 }
 
 .theme-dark {
@@ -82,6 +90,14 @@
   --field-border-strong: rgba(181, 167, 227, 0.72);
   --field-focus-ring: rgba(181, 167, 227, 0.28);
   --field-placeholder: #94a3b8;
+  --kanban-column-bg: linear-gradient(180deg, rgba(26, 34, 52, 0.94) 0%, rgba(18, 24, 38, 0.98) 100%);
+  --kanban-column-shadow: 0 22px 38px rgba(0, 0, 0, 0.3);
+  --kanban-card-bg: rgba(30, 39, 59, 0.92);
+  --kanban-card-border: rgba(148, 163, 184, 0.18);
+  --kanban-card-shadow: 0 16px 28px rgba(0, 0, 0, 0.24);
+  --kanban-card-hover-bg: rgba(36, 47, 69, 0.96);
+  --kanban-card-hover-border: rgba(255, 122, 47, 0.4);
+  --kanban-card-hover-shadow: 0 22px 38px rgba(0, 0, 0, 0.32);
 }
 
 .theme-light {
@@ -132,6 +148,7 @@ body {
   background: var(--card-bg);
   border: 1px solid var(--card-border);
   backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
   box-shadow: 0 20px 40px var(--card-shadow);
 }
 
@@ -195,8 +212,354 @@ body {
   border-radius: 14px;
 }
 
+.data-table-header {
+  padding: 0 0.2rem 0.75rem;
+}
+
+.data-table-row {
+  width: 100%;
+  padding: 0.85rem 0.9rem;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 14px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.04), transparent), var(--surface-soft);
+}
+
+.data-table-row:hover {
+  transform: translateY(-1px);
+  border-color: rgba(123, 115, 154, 0.28);
+}
+
+.data-table-empty {
+  width: 100%;
+  padding: 1rem;
+  border: 1px dashed var(--card-border);
+  border-radius: 14px;
+  background: var(--surface-soft);
+}
+
+.table-cell {
+  justify-content: center;
+  min-height: 42px;
+}
+
 .workspace-shell {
   isolation: isolate;
+}
+
+.workflow-canvas {
+  border: 1px solid var(--card-border);
+  border-radius: 14px;
+  padding: 0.9rem;
+  background:
+    linear-gradient(var(--network-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--network-line) 1px, transparent 1px),
+    var(--dropzone-bg);
+  background-size: 24px 24px, 24px 24px, auto;
+  min-height: 320px;
+}
+
+.workflow-node {
+  background: var(--card-bg);
+  border: 1px solid var(--card-border);
+  border-radius: 12px;
+  padding: 0.7rem;
+  box-shadow: 0 10px 20px var(--card-shadow);
+}
+
+.workflow-node:hover {
+  transform: translateY(-1px);
+}
+
+.workflow-connection-line {
+  border-radius: 999px;
+  animation: flowPulse 1.8s ease-in-out infinite;
+}
+
+.workflow-logs {
+  border: 1px solid var(--card-border);
+  border-radius: 12px;
+  padding: 0.8rem;
+  background: var(--surface-soft);
+  min-height: 100px;
+}
+
+.permission-lane {
+  position: relative;
+  width: 100%;
+  overflow: hidden;
+  border-radius: 18px;
+  padding: 1rem;
+  min-height: 420px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  transition:
+    transform 160ms ease,
+    border-color 160ms ease,
+    background 160ms ease,
+    box-shadow 160ms ease;
+}
+
+.permission-lane::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto auto 0;
+  width: 100%;
+  height: 3px;
+  background: linear-gradient(90deg, var(--brand-purple) 0%, var(--brand-orange) 100%);
+  opacity: 0.18;
+}
+
+.permission-lane:hover {
+  transform: translateY(-2px);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 16px 28px rgba(17, 24, 39, 0.08);
+}
+
+.permission-card {
+  display: block;
+  position: relative;
+  width: calc(100% - 0.5rem);
+  max-width: 100%;
+  margin: 0.25rem;
+  border: 1px solid var(--card-border);
+  border-radius: 16px;
+  padding: 0.9rem;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.05), transparent 46%),
+    var(--card-bg);
+  box-shadow: 0 12px 24px var(--card-shadow);
+  cursor: grab;
+  transition:
+    transform 160ms ease,
+    box-shadow 160ms ease,
+    border-color 160ms ease,
+    background 160ms ease,
+    opacity 160ms ease;
+  will-change: transform, box-shadow;
+}
+
+.permission-card::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto auto 0;
+  width: 100%;
+  height: 3px;
+  background: linear-gradient(90deg, var(--brand-purple) 0%, var(--brand-orange) 100%);
+  opacity: 0.22;
+}
+
+.permission-card:hover {
+  transform: translateY(-5px);
+  border-color: rgba(255, 122, 47, 0.58);
+  background:
+    linear-gradient(180deg, rgba(255, 122, 47, 0.08), rgba(123, 115, 154, 0.06)),
+    var(--card-bg);
+  box-shadow:
+    0 0 0 1px rgba(255, 122, 47, 0.14),
+    0 22px 38px rgba(17, 24, 39, 0.2);
+}
+
+.permission-card:hover::before {
+  opacity: 0.42;
+}
+
+.permission-card .rt-Badge {
+  align-self: flex-start;
+}
+
+.permission-card:active,
+.permission-card.is-dragging {
+  cursor: grabbing;
+}
+
+.permission-card.is-dragging {
+  opacity: 0.58;
+  transform: rotate(1deg) translateY(-6px);
+  box-shadow: 0 28px 44px rgba(17, 24, 39, 0.22);
+  border-color: rgba(123, 115, 154, 0.54);
+}
+
+.permission-empty-state {
+  min-height: 96px;
+  display: flex;
+  align-items: center;
+}
+
+.permission-lane.is-drop-target {
+  transform: translateY(-2px);
+  border-color: rgba(255, 81, 0, 0.48) !important;
+  box-shadow: inset 0 0 0 1px rgba(255, 81, 0, 0.16), 0 20px 28px rgba(17, 24, 39, 0.08);
+}
+
+.permission-card.is-drop-commit {
+  animation: permissionDropCommit 260ms ease;
+}
+
+@keyframes permissionDropCommit {
+  0% {
+    transform: scale(0.98);
+  }
+
+  55% {
+    transform: scale(1.04);
+  }
+
+  100% {
+    transform: scale(1);
+  }
+}
+
+.permission-template-box {
+  width: 100%;
+  padding: 0.9rem;
+  border-radius: 14px;
+  border: 1px solid var(--card-border);
+  background: var(--surface-soft);
+}
+
+.workspace-guide {
+  width: 100%;
+  padding: 0.9rem 1rem;
+  border-radius: 16px;
+  border: 1px solid var(--card-border);
+  background:
+    linear-gradient(120deg, rgba(255, 81, 0, 0.06) 0%, rgba(123, 115, 154, 0.08) 100%),
+    var(--surface-soft);
+}
+
+.field-block {
+  justify-content: flex-start;
+  min-height: 98px;
+}
+
+.custom-option-shell {
+  min-height: 46px;
+  padding: 0.28rem 0.35rem 0.28rem 0.55rem;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 122, 47, 0.34);
+  background:
+    linear-gradient(135deg, rgba(255, 122, 47, 0.14) 0%, rgba(255, 255, 255, 0.04) 100%),
+    rgba(255, 122, 47, 0.08);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.2),
+    0 8px 18px rgba(255, 122, 47, 0.08);
+}
+
+.custom-option-shell:focus-within {
+  border-color: rgba(255, 122, 47, 0.5);
+  box-shadow:
+    0 0 0 3px rgba(255, 122, 47, 0.12),
+    inset 0 1px 0 rgba(255, 255, 255, 0.24),
+    0 10px 24px rgba(255, 122, 47, 0.12);
+}
+
+.custom-option-input {
+  min-height: 36px;
+  border: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  outline: none !important;
+  border-radius: 0 !important;
+  padding: 0 !important;
+}
+
+.custom-option-input:focus,
+.custom-option-input:focus-visible {
+  border: 0 !important;
+  box-shadow: none !important;
+  outline: none !important;
+}
+
+.custom-option-ok {
+  min-width: 68px;
+  min-height: 36px;
+  padding: 0 0.9rem !important;
+  border-radius: 12px !important;
+  border: 1px solid rgba(255, 122, 47, 0.42) !important;
+  background: rgba(255, 122, 47, 0.18) !important;
+  color: #fdba74 !important;
+  font-weight: 600 !important;
+  box-shadow: none !important;
+}
+
+.custom-option-ok:hover {
+  background: rgba(255, 122, 47, 0.26) !important;
+  border-color: rgba(255, 122, 47, 0.52) !important;
+}
+
+.auth-shell {
+  border-radius: 28px;
+}
+
+.auth-hero {
+  flex: 1.1;
+  min-height: 520px;
+  padding: 2rem;
+  border-radius: 24px;
+  background:
+    radial-gradient(circle at top left, rgba(255, 81, 0, 0.18) 0%, transparent 34%),
+    radial-gradient(circle at bottom right, rgba(123, 115, 154, 0.18) 0%, transparent 40%),
+    linear-gradient(160deg, rgba(255, 255, 255, 0.92) 0%, rgba(246, 248, 252, 0.84) 100%);
+  border: 1px solid var(--card-border);
+}
+
+.theme-dark .auth-hero {
+  background:
+    radial-gradient(circle at top left, rgba(255, 81, 0, 0.2) 0%, transparent 34%),
+    radial-gradient(circle at bottom right, rgba(181, 167, 227, 0.18) 0%, transparent 40%),
+    linear-gradient(160deg, rgba(22, 28, 42, 0.96) 0%, rgba(18, 24, 38, 0.88) 100%);
+}
+
+.auth-panel {
+  flex: 0.9;
+  padding: 2rem;
+  border-radius: 24px;
+  background: var(--card-bg);
+  border: 1px solid var(--card-border);
+}
+
+.auth-tab {
+  min-width: 112px;
+}
+
+.auth-note {
+  width: 100%;
+  padding: 0.85rem 0.95rem;
+  border-radius: 14px;
+  border: 1px solid var(--card-border);
+  background: var(--surface-soft);
+}
+
+@media (max-width: 900px) {
+  .auth-shell > div {
+    flex-direction: column;
+  }
+
+  .auth-hero,
+  .auth-panel {
+    min-height: auto;
+    width: 100%;
+  }
+}
+
+.sticky-note {
+  background: #fef3c7;
+  border: 1px solid #f59e0b;
+  border-radius: 10px;
+  padding: 0.55rem 0.65rem;
+  width: 100%;
+}
+
+@keyframes flowPulse {
+  0% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 0.95;
+  }
+  100% {
+    opacity: 0.35;
+  }
 }
 
 .dropzone-area {
@@ -314,9 +677,14 @@ body {
 /* Select dropdown surfaces follow current theme (prevents black popup). */
 .app-theme .rt-SelectContent,
 .app-theme .rt-SelectViewport {
-  background: var(--card-bg) !important;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(123, 115, 154, 0.05)),
+    var(--card-bg) !important;
   border: 1px solid var(--card-border) !important;
   color: var(--text-primary) !important;
+  box-shadow: 0 20px 34px var(--card-shadow) !important;
+  border-radius: 14px !important;
+  padding: 0.35rem !important;
 }
 
 .app-theme .rt-SelectItem {
@@ -324,16 +692,29 @@ body {
 }
 
 .app-theme .rt-SelectItem[data-highlighted] {
-  background: var(--active-item-bg) !important;
+  background: linear-gradient(90deg, rgba(123, 115, 154, 0.16) 0%, rgba(255, 122, 47, 0.08) 100%) !important;
   color: var(--text-primary) !important;
+  border-radius: 10px !important;
+}
+
+.app-theme .rt-SelectItem[data-state="checked"] {
+  background: linear-gradient(90deg, rgba(123, 115, 154, 0.22) 0%, rgba(255, 122, 47, 0.10) 100%) !important;
+  color: var(--text-primary) !important;
+  font-weight: 700 !important;
+  border-radius: 10px !important;
 }
 
 /* Global fallback for portal-based select content outside local container scope. */
 .rt-SelectContent,
 .rt-SelectViewport {
-  background: var(--card-bg) !important;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(123, 115, 154, 0.05)),
+    var(--card-bg) !important;
   border: 1px solid var(--card-border) !important;
   color: var(--text-primary) !important;
+  box-shadow: 0 20px 34px var(--card-shadow) !important;
+  border-radius: 14px !important;
+  padding: 0.35rem !important;
 }
 
 .rt-SelectItem {
@@ -341,8 +722,128 @@ body {
 }
 
 .rt-SelectItem[data-highlighted] {
-  background: var(--active-item-bg) !important;
+  background: linear-gradient(90deg, rgba(123, 115, 154, 0.16) 0%, rgba(255, 122, 47, 0.08) 100%) !important;
   color: var(--text-primary) !important;
+  border-radius: 10px !important;
+}
+
+.rt-SelectItem[data-state="checked"] {
+  background: linear-gradient(90deg, rgba(123, 115, 154, 0.22) 0%, rgba(255, 122, 47, 0.10) 100%) !important;
+  color: var(--text-primary) !important;
+  font-weight: 700 !important;
+  border-radius: 10px !important;
+}
+
+.header-search-shell {
+  min-height: 42px;
+  padding: 0.2rem 0.65rem;
+  border-radius: 14px;
+  border: 1px solid var(--field-border);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.018), transparent 74%),
+    var(--field-bg);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 6px 14px rgba(15, 23, 42, 0.04);
+  overflow: hidden;
+}
+
+.header-search-shell:focus-within {
+  border-color: var(--field-border-strong);
+  box-shadow:
+    0 0 0 3px var(--field-focus-ring),
+    inset 0 1px 0 rgba(255, 255, 255, 0.2),
+    0 12px 22px rgba(15, 23, 42, 0.1);
+}
+
+.header-search-input {
+  width: 100%;
+  border: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  outline: none !important;
+  padding: 0 !important;
+  border-radius: 0 !important;
+  min-height: 30px;
+}
+
+.header-search-input:focus,
+.header-search-input:focus-visible {
+  border: 0 !important;
+  box-shadow: none !important;
+  outline: none !important;
+}
+
+.header-search-clear {
+  min-width: 68px;
+  height: 32px;
+  padding: 0 0.8rem;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 122, 47, 0.35) !important;
+  background: rgba(255, 122, 47, 0.12) !important;
+  color: #fdba74 !important;
+  font-size: 0.8rem;
+  font-weight: 500;
+  box-shadow: none !important;
+}
+
+.header-search-clear:hover {
+  background: rgba(255, 122, 47, 0.18) !important;
+  color: #ffedd5 !important;
+}
+
+.header-search-popover {
+  position: absolute;
+  top: calc(100% + 0.45rem);
+  left: 0;
+  z-index: 30;
+  padding: 0.5rem;
+  border-radius: 16px;
+  border: 1px solid var(--card-border);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.035), rgba(123, 115, 154, 0.05)),
+    var(--card-bg);
+  box-shadow: 0 24px 48px rgba(15, 23, 42, 0.18);
+  backdrop-filter: blur(16px);
+}
+
+.header-search-result {
+  width: 100%;
+  justify-content: flex-start;
+  text-align: left;
+  padding: 0.8rem 0.9rem;
+  border-radius: 12px;
+  border: 1px solid transparent;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+.header-search-result:hover {
+  background: linear-gradient(90deg, rgba(123, 115, 154, 0.14) 0%, rgba(255, 122, 47, 0.08) 100%) !important;
+  border-color: var(--active-item-border);
+  transform: translateY(-1px);
+}
+
+.primary-soft-action {
+  min-height: 40px;
+  padding: 0 1rem !important;
+  border: 1px solid rgba(255, 122, 47, 0.38) !important;
+  background: rgba(255, 122, 47, 0.18) !important;
+  color: #fdba74 !important;
+  border-radius: 12px !important;
+  font-weight: 500 !important;
+  box-shadow: none !important;
+}
+
+.primary-soft-action:hover {
+  background: rgba(255, 122, 47, 0.24) !important;
+  border-color: rgba(255, 122, 47, 0.50) !important;
+}
+
+.header-search-empty {
+  display: block;
+  width: 100%;
+  padding: 0.7rem 0.8rem;
 }
 
 @media (max-width: 768px) {

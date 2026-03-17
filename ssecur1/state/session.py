@@ -38,6 +38,7 @@ class SessionStateMixin(rx.State):
     selected_interview_id: str = ""
     interview_answer_map: dict[str, str] = {}
     interview_score_map: dict[str, str] = {}
+    interview_score_touched_ids: list[str] = []
     delete_confirm_open: bool = False
     pending_delete_kind: str = ""
     pending_delete_target_id: str = ""
@@ -74,8 +75,16 @@ class SessionStateMixin(rx.State):
         self.register_password_visible = not self.register_password_visible
 
     def set_active_view(self, view: str):
+        previous_view = self.active_view
         self.active_view = view
         self.mobile_menu_open = False
+        if view == "ia" and previous_view != "ia":
+            ai_preparer = getattr(self, "prepare_ai_view", None)
+            if callable(ai_preparer):
+                ai_preparer()
+        audit_logger = getattr(self, "_append_audit_entry", None)
+        if callable(audit_logger):
+            audit_logger("navigation.view", f"Visão ativa alterada para {view}", "navigation")
 
     def set_auth_mode(self, mode: str):
         self.auth_mode = mode
@@ -114,8 +123,24 @@ class SessionStateMixin(rx.State):
         self.pending_delete_label = ""
 
     def confirm_delete_action(self):
-        kind = self.pending_delete_kind
+        kind = (self.pending_delete_kind or "").strip().lower()
         raw_target = self.pending_delete_target_id
+        if kind == "project":
+            self.cancel_delete_confirmation()
+            if not str(raw_target).isdigit():
+                self.toast_message = "Identificador inválido para exclusão"
+                self.toast_type = "error"
+                return
+            self.delete_project_from_modal(int(raw_target))
+            return
+        if "interview" in kind or "entrevista" in kind:
+            self.cancel_delete_confirmation()
+            if not str(raw_target).strip():
+                self.toast_message = "Identificador inválido para exclusão"
+                self.toast_type = "error"
+                return
+            self.delete_interview_from_modal(str(raw_target))
+            return
         method_map = {
             "question": "delete_question",
             "user": "delete_user",
@@ -124,7 +149,6 @@ class SessionStateMixin(rx.State):
             "role": "delete_role",
             "responsibility": "delete_responsibility",
             "form": "delete_form",
-            "interview": "delete_interview_session",
             "workflow_box": "delete_workflow_box",
             "permission_box": "delete_permission_box",
         }
@@ -135,7 +159,7 @@ class SessionStateMixin(rx.State):
             self.toast_message = "Ação de exclusão não encontrada"
             self.toast_type = "error"
             return
-        int_kinds = {"question", "user", "client", "role", "responsibility", "form", "workflow_box", "permission_box"}
+        int_kinds = {"question", "user", "client", "project", "role", "responsibility", "form", "workflow_box", "permission_box"}
         target = raw_target
         if kind in int_kinds:
             if not str(raw_target).isdigit():
@@ -144,6 +168,123 @@ class SessionStateMixin(rx.State):
                 return
             target = int(raw_target)
         handler(target)
+
+    def delete_interview_from_modal(self, interview_id: str):
+        from ssecur1.db import InterviewSessionModel, ResponseModel
+
+        if not str(interview_id).isdigit():
+            self.toast_message = "Identificador inválido para exclusão"
+            self.toast_type = "error"
+            return
+        session = SessionLocal()
+        interview = (
+            session.query(InterviewSessionModel)
+            .filter(
+                InterviewSessionModel.id == int(interview_id),
+                InterviewSessionModel.tenant_id == self.current_tenant,
+            )
+            .first()
+        )
+        if not interview:
+            session.close()
+            self.toast_message = "Entrevista nao encontrada"
+            self.toast_type = "error"
+            return
+        session.query(ResponseModel).filter(
+            ResponseModel.tenant_id == self.current_tenant,
+            ResponseModel.interview_id == int(interview_id),
+        ).delete()
+        session.delete(interview)
+        session.commit()
+        session.close()
+        if self.selected_interview_id == str(interview_id):
+            self.selected_interview_id = ""
+            self.selected_form_id = ""
+            self.interview_answer_map = {}
+            self.interview_score_map = {}
+            if hasattr(self, "interview_draft_active"):
+                self.interview_draft_active = False
+        self.toast_message = "Entrevista excluida"
+        self.toast_type = "success"
+
+    def delete_project_from_modal(self, project_id: int):
+        from ssecur1.db import (
+            ActionPlanModel,
+            AssistantChunkModel,
+            AssistantDocumentModel,
+            InterviewSessionModel,
+            ProjectAssignmentModel,
+            ProjectModel,
+            ResponseModel,
+            WorkflowBoxModel,
+        )
+
+        session = SessionLocal()
+        project = (
+            session.query(ProjectModel)
+            .filter(
+                ProjectModel.id == int(project_id),
+                ProjectModel.tenant_id == self.current_tenant,
+            )
+            .first()
+        )
+        if not project:
+            session.close()
+            self.toast_message = "Projeto não encontrado"
+            self.toast_type = "error"
+            return
+
+        interview_ids = [
+            int(row[0])
+            for row in session.query(InterviewSessionModel.id)
+            .filter(InterviewSessionModel.project_id == int(project_id))
+            .all()
+            if row[0] is not None
+        ]
+        action_count = session.query(ActionPlanModel.id).filter(ActionPlanModel.project_id == int(project_id)).count()
+        workflow_count = session.query(WorkflowBoxModel.id).filter(WorkflowBoxModel.project_id == int(project_id)).count()
+        document_ids = [
+            int(row[0])
+            for row in session.query(AssistantDocumentModel.id)
+            .filter(AssistantDocumentModel.project_id == int(project_id))
+            .all()
+            if row[0] is not None
+        ]
+
+        if interview_ids:
+            session.query(ResponseModel).filter(ResponseModel.interview_id.in_(interview_ids)).delete(synchronize_session=False)
+            session.query(InterviewSessionModel).filter(InterviewSessionModel.id.in_(interview_ids)).delete(synchronize_session=False)
+        if action_count:
+            session.query(ActionPlanModel).filter(ActionPlanModel.project_id == int(project_id)).delete(synchronize_session=False)
+        if workflow_count:
+            session.query(WorkflowBoxModel).filter(WorkflowBoxModel.project_id == int(project_id)).delete(synchronize_session=False)
+        if document_ids:
+            session.query(AssistantChunkModel).filter(AssistantChunkModel.document_id.in_(document_ids)).delete(synchronize_session=False)
+            session.query(AssistantDocumentModel).filter(AssistantDocumentModel.id.in_(document_ids)).delete(synchronize_session=False)
+        session.query(ProjectAssignmentModel).filter(ProjectAssignmentModel.project_id == int(project_id)).delete()
+        session.delete(project)
+        session.commit()
+        session.close()
+
+        if getattr(self, "selected_project_id", "") == str(project_id):
+            self.selected_project_id = ""
+        if getattr(self, "editing_project_id", "") == str(project_id):
+            cancel_edit_project = getattr(self, "cancel_edit_project", None)
+            if callable(cancel_edit_project):
+                cancel_edit_project()
+
+        details = []
+        if interview_ids:
+            details.append(f"{len(interview_ids)} entrevista(s)")
+        if action_count:
+            details.append(f"{action_count} plano(s)")
+        if workflow_count:
+            details.append(f"{workflow_count} caixa(s) de workflow")
+        if document_ids:
+            details.append(f"{len(document_ids)} documento(s) IA")
+        suffix = f" em cascata: {', '.join(details)}" if details else ""
+        self.toast_message = f"Projeto excluído{suffix}"
+        self.toast_type = "success"
 
     def hydrate_tenant_context(self):
         projects = getattr(self, "projects_data", [])
@@ -194,6 +335,9 @@ class SessionStateMixin(rx.State):
             self.auth_open = False
             self.toast_message = "Login realizado com sucesso"
             self.toast_type = "success"
+        audit_logger = getattr(self, "_append_audit_entry", None)
+        if callable(audit_logger):
+            audit_logger("auth.login", f"Login efetuado por {user.email}", "security")
         session.close()
 
     def complete_first_access_password_change(self):
@@ -251,6 +395,7 @@ class SessionStateMixin(rx.State):
         self.auth_mode = "login"
 
     def logout(self):
+        previous_user = self.login_email.strip().lower() or "anonimo"
         self.is_logged = False
         self.user_role = "viewer"
         self.user_scope = "smartlab"
@@ -266,3 +411,6 @@ class SessionStateMixin(rx.State):
         self.interview_answer_map = {}
         self.interview_score_map = {}
         self.active_view = "dashboard"
+        audit_logger = getattr(self, "_append_audit_entry", None)
+        if callable(audit_logger):
+            audit_logger("auth.logout", f"Logout efetuado por {previous_user}", "security")

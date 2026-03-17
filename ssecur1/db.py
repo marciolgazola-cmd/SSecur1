@@ -19,6 +19,7 @@ class TenantModel(Base):
     name = Column(String, nullable=False)
     slug = Column(String, nullable=False, unique=True)
     owner_client_id = Column(Integer, nullable=True)
+    assigned_client_ids = Column(Text, default="[]")
     limit_users = Column(Integer, default=50)
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -87,6 +88,7 @@ class SurveyModel(Base):
     tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False)
     name = Column(String, nullable=False)
     service_name = Column(String, nullable=False, default="Diagnóstico Cultura de Segurança")
+    stage_name = Column(String, nullable=False, default="Visita Técnica - Guiada")
     share_token = Column(String, nullable=True)
     legacy_form_id = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -147,6 +149,8 @@ class InterviewSessionModel(Base):
     project_id = Column(Integer, nullable=True)
     client_id = Column(Integer, nullable=True)
     interviewee_user_id = Column(Integer, nullable=True)
+    target_area = Column(String, nullable=True)
+    audience_group = Column(String, nullable=True)
     interview_date = Column(String, default="")
     interviewee_name = Column(String, nullable=False)
     interviewee_role = Column(String, nullable=True)
@@ -165,6 +169,9 @@ class ProjectModel(Base):
     tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False)
     name = Column(String, nullable=False)
     project_type = Column(String, default="Diagnóstico de Cultura")
+    service_name = Column(String, default="Diagnóstico Cultura de Segurança")
+    client_id = Column(Integer, nullable=True)
+    contracted_at = Column(String, default="")
     status = Column(String, default="planejamento")
     progress = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -198,6 +205,10 @@ class ActionPlanModel(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False)
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    client_id = Column(Integer, nullable=True)
+    service_name = Column(String, default="")
+    dimension_names = Column(Text, default="")
+    target_area = Column(String, default="")
     title = Column(String, nullable=False)
     owner = Column(String, nullable=False)
     due_date = Column(String, default="")
@@ -205,6 +216,46 @@ class ActionPlanModel(Base):
     expected_result = Column(Text, default="")
     actual_result = Column(Text, default="")
     attainment = Column(Integer, default=0)
+
+
+class AssistantDocumentModel(Base):
+    __tablename__ = "assistant_documents"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
+    knowledge_scope = Column(String, default="tenant")
+    file_name = Column(String, nullable=False)
+    file_path = Column(String, nullable=False)
+    resource_type = Column(String, default="politica")
+    file_size = Column(Integer, default=0)
+    uploaded_by = Column(String, default="sistema")
+    uploaded_at = Column(DateTime, default=datetime.utcnow)
+
+
+class AssistantChunkModel(Base):
+    __tablename__ = "assistant_chunks"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    document_id = Column(Integer, ForeignKey("assistant_documents.id"), nullable=False)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
+    knowledge_scope = Column(String, default="tenant")
+    chunk_index = Column(Integer, default=0)
+    content = Column(Text, nullable=False)
+    keyword_blob = Column(Text, default="")
+    embedding_json = Column(Text, default="[]")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class CustomOptionModel(Base):
+    __tablename__ = "custom_options"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False)
+    catalog_key = Column(String, nullable=False)
+    option_value = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 class PermissionBoxModel(Base):
@@ -272,6 +323,7 @@ def ensure_schema_updates() -> None:
         _safe_add_column(conn, "users", "reports_to_user_id", "ALTER TABLE users ADD COLUMN reports_to_user_id INTEGER;")
         _safe_add_column(conn, "users", "assigned_client_ids", "ALTER TABLE users ADD COLUMN assigned_client_ids TEXT DEFAULT '[]';")
         _safe_add_column(conn, "tenants", "owner_client_id", "ALTER TABLE tenants ADD COLUMN owner_client_id INTEGER;")
+        _safe_add_column(conn, "tenants", "assigned_client_ids", "ALTER TABLE tenants ADD COLUMN assigned_client_ids TEXT DEFAULT '[]';")
         _safe_add_column(conn, "clients", "trade_name", "ALTER TABLE clients ADD COLUMN trade_name VARCHAR;")
         _safe_add_column(conn, "clients", "phone", "ALTER TABLE clients ADD COLUMN phone VARCHAR;")
         _safe_add_column(conn, "clients", "address", "ALTER TABLE clients ADD COLUMN address VARCHAR;")
@@ -285,6 +337,7 @@ def ensure_schema_updates() -> None:
         _safe_add_column(conn, "forms", "target_client_id", "ALTER TABLE forms ADD COLUMN target_client_id INTEGER;")
         _safe_add_column(conn, "forms", "target_user_email", "ALTER TABLE forms ADD COLUMN target_user_email VARCHAR;")
         _safe_add_column(conn, "surveys", "service_name", "ALTER TABLE surveys ADD COLUMN service_name VARCHAR DEFAULT 'Diagnóstico Cultura de Segurança';")
+        _safe_add_column(conn, "surveys", "stage_name", "ALTER TABLE surveys ADD COLUMN stage_name VARCHAR DEFAULT 'Visita Técnica - Guiada';")
         _safe_add_column(conn, "surveys", "share_token", "ALTER TABLE surveys ADD COLUMN share_token VARCHAR;")
         _safe_add_column(conn, "surveys", "legacy_form_id", "ALTER TABLE surveys ADD COLUMN legacy_form_id INTEGER;")
         _safe_add_column(conn, "questions", "dimension", "ALTER TABLE questions ADD COLUMN dimension VARCHAR;")
@@ -301,8 +354,19 @@ def ensure_schema_updates() -> None:
         _safe_add_column(conn, "responses", "submitted_at", "ALTER TABLE responses ADD COLUMN submitted_at DATETIME;")
         _safe_add_column(conn, "interview_sessions", "interviewee_user_id", "ALTER TABLE interview_sessions ADD COLUMN interviewee_user_id INTEGER;")
         _safe_add_column(conn, "interview_sessions", "survey_id", "ALTER TABLE interview_sessions ADD COLUMN survey_id INTEGER;")
+        _safe_add_column(conn, "interview_sessions", "target_area", "ALTER TABLE interview_sessions ADD COLUMN target_area VARCHAR;")
+        _safe_add_column(conn, "interview_sessions", "audience_group", "ALTER TABLE interview_sessions ADD COLUMN audience_group VARCHAR;")
         _safe_add_column(conn, "interview_sessions", "total_score", "ALTER TABLE interview_sessions ADD COLUMN total_score INTEGER DEFAULT 0;")
         _safe_add_column(conn, "interview_sessions", "dimension_scores_json", "ALTER TABLE interview_sessions ADD COLUMN dimension_scores_json TEXT DEFAULT '{}';")
+        _safe_add_column(conn, "projects", "service_name", "ALTER TABLE projects ADD COLUMN service_name VARCHAR DEFAULT 'Diagnóstico Cultura de Segurança';")
+        _safe_add_column(conn, "projects", "client_id", "ALTER TABLE projects ADD COLUMN client_id INTEGER;")
+        _safe_add_column(conn, "projects", "contracted_at", "ALTER TABLE projects ADD COLUMN contracted_at VARCHAR DEFAULT '';")
+        _safe_add_column(conn, "action_plans", "client_id", "ALTER TABLE action_plans ADD COLUMN client_id INTEGER;")
+        _safe_add_column(conn, "action_plans", "service_name", "ALTER TABLE action_plans ADD COLUMN service_name VARCHAR DEFAULT '';")
+        _safe_add_column(conn, "action_plans", "dimension_names", "ALTER TABLE action_plans ADD COLUMN dimension_names TEXT DEFAULT '';")
+        _safe_add_column(conn, "action_plans", "target_area", "ALTER TABLE action_plans ADD COLUMN target_area VARCHAR DEFAULT '';")
+        _safe_add_column(conn, "assistant_documents", "knowledge_scope", "ALTER TABLE assistant_documents ADD COLUMN knowledge_scope VARCHAR DEFAULT 'tenant';")
+        conn.exec_driver_sql("UPDATE assistant_documents SET knowledge_scope = 'tenant' WHERE knowledge_scope IS NULL;")
 
 
 Base.metadata.create_all(bind=engine)

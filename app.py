@@ -1,14 +1,25 @@
 import json
+import math
 import re
 import secrets
+import subprocess
+import urllib.request
+import urllib.error
+import xml.etree.ElementTree as ET
+import zipfile
 from datetime import datetime
+from hashlib import sha1
 from pathlib import Path
 from typing import Any
 
 import reflex as rx
+from sqlalchemy import or_
 from ssecur1.db import (
     ActionPlanModel,
+    AssistantChunkModel,
+    AssistantDocumentModel,
     ClientModel,
+    CustomOptionModel,
     DashboardBoxModel,
     FormModel,
     InterviewSessionModel,
@@ -198,6 +209,23 @@ PERMISSION_RESOURCE_CATALOG = [
     },
 ]
 
+CATALOG_SCOPE_DEFAULT = "default"
+CATALOG_SCOPE_CURRENT = "current"
+CATALOG_SCOPE_BY_KEY = {
+    "business_sector": CATALOG_SCOPE_CURRENT,
+    "user_profession": CATALOG_SCOPE_CURRENT,
+    "user_department": CATALOG_SCOPE_CURRENT,
+    "smartlab_service": CATALOG_SCOPE_DEFAULT,
+    "survey_stage": CATALOG_SCOPE_DEFAULT,
+    "question_dimension": CATALOG_SCOPE_DEFAULT,
+}
+
+
+def _catalog_tenant_for_key(current_tenant: str, catalog_key: str) -> str:
+    if CATALOG_SCOPE_BY_KEY.get(catalog_key) == CATALOG_SCOPE_DEFAULT:
+        return "default"
+    return current_tenant
+
 ROLE_TEMPLATE_CATALOG = {
     "admin": {
         "label": "Admin SmartLab",
@@ -264,6 +292,252 @@ BRAZILIAN_STATE_CODES = [
     "MG", "PA", "PB", "PR", "PE", "PI", "RJ", "RN", "RS", "RO", "RR", "SC",
     "SP", "SE", "TO",
 ]
+
+AUDIT_LOG_PATH = Path(".states") / "audit.log"
+EMBED_MODEL = "nomic-embed-text:latest"
+
+
+def _run_ollama_command(*args: str, input_text: str | None = None, timeout: int = 60) -> str:
+    try:
+        result = subprocess.run(
+            ["ollama", *args],
+            input=input_text,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=timeout,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+    if result.returncode != 0:
+        return ""
+    return (result.stdout or "").strip()
+
+
+def _parse_ollama_list(raw_output: str) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    lines = [line.rstrip() for line in raw_output.splitlines() if line.strip()]
+    if len(lines) <= 1:
+        return rows
+    for line in lines[1:]:
+        parts = re.split(r"\s{2,}", line.strip())
+        if len(parts) < 4:
+            continue
+        rows.append(
+            {
+                "name": parts[0],
+                "id": parts[1],
+                "size": parts[2],
+                "modified": parts[3],
+            }
+        )
+    return rows
+
+
+def _append_audit_file(entry: dict[str, str]) -> None:
+    AUDIT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with AUDIT_LOG_PATH.open("a", encoding="utf-8") as audit_file:
+        audit_file.write(json.dumps(entry, ensure_ascii=True) + "\n")
+
+
+def _normalize_space(value: str) -> str:
+    return re.sub(r"\s+", " ", value or "").strip()
+
+
+def _extract_text_from_pdf(file_path: Path) -> str:
+    try:
+        result = subprocess.run(
+            ["pdftotext", str(file_path), "-"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+    if result.returncode != 0:
+        return ""
+    return _normalize_space(result.stdout)
+
+
+def _extract_text_from_docx(file_path: Path) -> str:
+    try:
+        with zipfile.ZipFile(file_path) as archive:
+            fragments: list[str] = []
+            for member in archive.namelist():
+                if not member.startswith("word/") or not member.endswith(".xml"):
+                    continue
+                if "document.xml" not in member and "header" not in member and "footer" not in member:
+                    continue
+                root = ET.fromstring(archive.read(member))
+                texts = [node.text or "" for node in root.iter() if node.tag.endswith("}t") and (node.text or "").strip()]
+                if texts:
+                    fragments.append(" ".join(texts))
+            return _normalize_space("\n".join(fragments))
+    except (OSError, KeyError, ET.ParseError, zipfile.BadZipFile):
+        return ""
+
+
+def _extract_text_from_xlsx(file_path: Path) -> str:
+    try:
+        with zipfile.ZipFile(file_path) as archive:
+            shared_strings: list[str] = []
+            if "xl/sharedStrings.xml" in archive.namelist():
+                root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+                for item in root.iter():
+                    if item.tag.endswith("}t") and item.text:
+                        shared_strings.append(item.text)
+            fragments: list[str] = []
+            for member in archive.namelist():
+                if not member.startswith("xl/worksheets/") or not member.endswith(".xml"):
+                    continue
+                root = ET.fromstring(archive.read(member))
+                row_values: list[str] = []
+                for cell in root.iter():
+                    if not cell.tag.endswith("}c"):
+                        continue
+                    value_text = ""
+                    cell_type = cell.attrib.get("t", "")
+                    value_node = next((child for child in cell if child.tag.endswith("}v") and child.text), None)
+                    inline_node = next((child for child in cell.iter() if child.tag.endswith("}t") and child.text), None)
+                    if cell_type == "s" and value_node is not None:
+                        idx = int(value_node.text or "0")
+                        if 0 <= idx < len(shared_strings):
+                            value_text = shared_strings[idx]
+                    elif inline_node is not None:
+                        value_text = inline_node.text or ""
+                    elif value_node is not None:
+                        value_text = value_node.text or ""
+                    if value_text.strip():
+                        row_values.append(value_text.strip())
+                if row_values:
+                    sheet_name = Path(member).stem
+                    fragments.append(f"{sheet_name}: {' | '.join(row_values)}")
+            return _normalize_space("\n".join(fragments))
+    except (OSError, ET.ParseError, zipfile.BadZipFile, ValueError):
+        return ""
+
+
+def _extract_text_from_plain(file_path: Path) -> str:
+    for encoding in ("utf-8", "latin-1"):
+        try:
+            return _normalize_space(file_path.read_text(encoding=encoding))
+        except OSError:
+            return ""
+        except UnicodeDecodeError:
+            continue
+    return ""
+
+
+def _extract_document_text(file_path: Path) -> str:
+    suffix = file_path.suffix.lower()
+    if suffix == ".pdf":
+        return _extract_text_from_pdf(file_path)
+    if suffix == ".docx":
+        return _extract_text_from_docx(file_path)
+    if suffix == ".xlsx":
+        return _extract_text_from_xlsx(file_path)
+    if suffix in {".txt", ".md", ".csv", ".json"}:
+        return _extract_text_from_plain(file_path)
+    return ""
+
+
+def _chunk_text(content: str, max_chars: int = 1400, overlap: int = 220) -> list[str]:
+    normalized = _normalize_space(content)
+    if not normalized:
+        return []
+    chunks: list[str] = []
+    cursor = 0
+    length = len(normalized)
+    while cursor < length:
+        end = min(length, cursor + max_chars)
+        if end < length:
+            split_at = normalized.rfind(". ", cursor, end)
+            if split_at <= cursor:
+                split_at = normalized.rfind(" ", cursor, end)
+            if split_at > cursor:
+                end = split_at + 1
+        chunk = normalized[cursor:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        if end >= length:
+            break
+        cursor = max(end - overlap, cursor + 1)
+    return chunks
+
+
+def _keyword_blob(content: str, max_terms: int = 60) -> str:
+    words = re.findall(r"[a-zA-Z0-9_À-ÿ-]{3,}", (content or "").lower())
+    counts: dict[str, int] = {}
+    for word in words:
+        counts[word] = counts.get(word, 0) + 1
+    top_words = [word for word, _ in sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:max_terms]]
+    return " ".join(top_words)
+
+
+def _cosine_similarity(left: list[float], right: list[float]) -> float:
+    if not left or not right or len(left) != len(right):
+        return 0.0
+    dot = sum(a * b for a, b in zip(left, right))
+    left_norm = math.sqrt(sum(a * a for a in left))
+    right_norm = math.sqrt(sum(b * b for b in right))
+    if left_norm == 0 or right_norm == 0:
+        return 0.0
+    return dot / (left_norm * right_norm)
+
+
+def _lexical_overlap_score(query: str, content: str, keyword_blob: str = "") -> float:
+    query_terms = set(re.findall(r"[a-zA-Z0-9_À-ÿ-]{3,}", (query or "").lower()))
+    if not query_terms:
+        return 0.0
+    haystack = f"{content} {keyword_blob}".lower()
+    matches = sum(1 for term in query_terms if term in haystack)
+    return matches / max(len(query_terms), 1)
+
+
+def _request_ollama_json(path: str, payload: dict[str, Any], timeout: int = 30) -> dict[str, Any]:
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        f"http://127.0.0.1:11434{path}",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8")
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _ollama_embed_texts(texts: list[str], model: str = EMBED_MODEL) -> list[list[float]]:
+    embeddings: list[list[float]] = []
+    for text in texts:
+        payload = {"model": model, "input": text}
+        parsed = _request_ollama_json("/api/embed", payload, timeout=45)
+        vector = parsed.get("embeddings")
+        if isinstance(vector, list) and vector and isinstance(vector[0], list):
+            try:
+                embeddings.append([float(value) for value in vector[0]])
+                continue
+            except (TypeError, ValueError):
+                pass
+        fallback = parsed.get("embedding")
+        if isinstance(fallback, list):
+            try:
+                embeddings.append([float(value) for value in fallback])
+                continue
+            except (TypeError, ValueError):
+                pass
+        embeddings.append([])
+    return embeddings
+
+
 def smartlab_logo(size: str = "44px") -> rx.Component:
     return rx.image(
         src="/LogoSmartLab.jpeg",
@@ -279,6 +553,16 @@ class State(SessionStateMixin):
     dragged_question_text: str = ""
     uploaded_resources: list[str] = []
     global_search_query: str = ""
+    ai_selected_model: str = ""
+    ai_resource_type: str = "politica"
+    ai_knowledge_scope: str = "tenant"
+    ai_scope_mode: str = "tenant"
+    ai_history: list[dict[str, str]] = []
+    audit_filter_scope: str = "Todos"
+    audit_filter_event: str = "Todos"
+    audit_filter_tenant: str = "Todos"
+    audit_filter_user: str = "Todos"
+    audit_expanded_event_ids: list[str] = []
 
     new_user_name: str = ""
     new_user_email: str = ""
@@ -314,6 +598,8 @@ class State(SessionStateMixin):
     new_tenant_slug: str = ""
     new_tenant_limit: str = "50"
     new_tenant_client_id: str = ""
+    new_tenant_assigned_client_ids: list[str] = []
+    new_tenant_assigned_clients_open: bool = False
     editing_tenant_id: str = ""
 
     new_role_name: str = ""
@@ -326,6 +612,9 @@ class State(SessionStateMixin):
 
     new_form_name: str = ""
     new_form_category: str = "Diagnóstico Cultura de Segurança"
+    new_form_custom_category: str = ""
+    new_form_stage: str = "Visita Técnica - Guiada"
+    new_form_custom_stage: str = ""
     new_form_target_client_id: str = ""
     new_form_target_user_email: str = ""
     selected_form_id: str = ""
@@ -335,9 +624,18 @@ class State(SessionStateMixin):
     new_interview_project_id: str = ""
     new_interview_client_id: str = ""
     new_interview_user_id: str = ""
+    new_interview_area: str = ""
+    new_interview_group_name: str = ""
     new_interview_date: str = ""
     new_interview_notes: str = ""
+    interview_draft_active: bool = False
     editing_interview_id: str = ""
+    editing_interview_table_id: str = ""
+    edit_interview_form_id: str = ""
+    edit_interview_project_id: str = ""
+    edit_interview_client_id: str = ""
+    edit_interview_date: str = ""
+    edit_interview_status: str = "em_andamento"
     new_question_text: str = ""
     new_question_type: str = "escala_0_5"
     new_question_dimension: str = "Presença"
@@ -353,6 +651,12 @@ class State(SessionStateMixin):
 
     new_project_name: str = ""
     new_project_type: str = "Diagnóstico de Cultura"
+    new_project_service_name: str = "Diagnóstico Cultura de Segurança"
+    new_project_custom_service_name: str = ""
+    new_project_client_id: str = ""
+    new_project_contracted_at: str = ""
+    editing_project_id: str = ""
+    project_portfolio_service_filter: str = "Todos"
     project_admin_tab: str = "cadastro"
     new_project_assigned_client_ids: list[str] = []
     new_project_assigned_clients_open: bool = False
@@ -375,6 +679,8 @@ class State(SessionStateMixin):
     new_action_owner: str = ""
     new_action_due_date: str = ""
     new_action_expected_result: str = ""
+    new_action_dimensions: str = ""
+    new_action_area: str = ""
 
     perm_user_email: str = ""
     perm_selected_module: str = "Todos"
@@ -387,6 +693,275 @@ class State(SessionStateMixin):
     new_dashboard_box_description: str = ""
 
     testimonial_index: int = 0
+
+    def _append_audit_entry(self, event: str, detail: str, scope: str = "info", extra: dict[str, str] | None = None):
+        entry = {
+            "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "event": event,
+            "detail": detail,
+            "scope": scope,
+            "tenant": self.current_tenant,
+            "user": self.login_email.strip().lower() or "anonimo",
+            "view": self.active_view,
+        }
+        if extra:
+            entry.update({str(key): str(value) for key, value in extra.items()})
+        _append_audit_file(entry)
+
+    def _catalog_options(self, catalog_key: str) -> list[str]:
+        tenant_id = _catalog_tenant_for_key(self.current_tenant, catalog_key)
+        session = SessionLocal()
+        rows = (
+            session.query(CustomOptionModel.option_value)
+            .filter(
+                CustomOptionModel.tenant_id == tenant_id,
+                CustomOptionModel.catalog_key == catalog_key,
+            )
+            .order_by(CustomOptionModel.option_value.asc())
+            .all()
+        )
+        session.close()
+        values: list[str] = []
+        seen: set[str] = set()
+        for row in rows:
+            raw = str(row[0] or "").strip()
+            if not raw:
+                continue
+            normalized = raw.casefold()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            values.append(raw)
+        return values
+
+    def _register_catalog_option(self, catalog_key: str, raw_value: str) -> str:
+        value = str(raw_value or "").strip()
+        if not value:
+            return ""
+        tenant_id = _catalog_tenant_for_key(self.current_tenant, catalog_key)
+        session = SessionLocal()
+        existing_rows = (
+            session.query(CustomOptionModel)
+            .filter(
+                CustomOptionModel.tenant_id == tenant_id,
+                CustomOptionModel.catalog_key == catalog_key,
+            )
+            .all()
+        )
+        existing = next(
+            (
+                row
+                for row in existing_rows
+                if str(row.option_value or "").strip().casefold() == value.casefold()
+            ),
+            None,
+        )
+        if existing is None:
+            session.add(
+                CustomOptionModel(
+                    tenant_id=tenant_id,
+                    catalog_key=catalog_key,
+                    option_value=value,
+                )
+            )
+            session.commit()
+        else:
+            value = str(existing.option_value or "").strip() or value
+        session.close()
+        return value
+
+    def prepare_ai_view(self):
+        self.ai_answer = ""
+        self.dragged_question_text = ""
+
+    def _resolve_ai_document_scope(self) -> tuple[str, int | None]:
+        target_tenant = self.selected_project_source_tenant if self.ai_scope_mode_effective == "projeto" else self.current_tenant
+        project_id = int(self.selected_project_id) if self.ai_scope_mode_effective == "projeto" and self.selected_project_id and self.selected_project_id.isdigit() else None
+        return target_tenant, project_id
+
+    def _visible_ai_documents_query(self, session):
+        target_tenant, project_id = self._resolve_ai_document_scope()
+        query = session.query(AssistantDocumentModel).filter(
+            or_(
+                (
+                    (AssistantDocumentModel.tenant_id == target_tenant)
+                    & (AssistantDocumentModel.knowledge_scope == "tenant")
+                ),
+                (AssistantDocumentModel.knowledge_scope == "smartlab"),
+            )
+        )
+        if project_id is not None:
+            query = query.filter(
+                (
+                    (AssistantDocumentModel.knowledge_scope == "smartlab")
+                    | (AssistantDocumentModel.project_id == project_id)
+                    | (AssistantDocumentModel.project_id.is_(None))
+                )
+            )
+        return query
+
+    def _retrieve_ai_chunks(self, query_text: str, limit: int = 6) -> list[dict[str, str]]:
+        prompt = (query_text or "").strip()
+        if not prompt:
+            return []
+        session = SessionLocal()
+        visible_docs = self._visible_ai_documents_query(session).all()
+        if not visible_docs:
+            session.close()
+            return []
+        doc_lookup = {int(doc.id): doc for doc in visible_docs}
+        rows = (
+            session.query(AssistantChunkModel)
+            .filter(AssistantChunkModel.document_id.in_(list(doc_lookup.keys())))
+            .order_by(AssistantChunkModel.document_id.asc(), AssistantChunkModel.chunk_index.asc())
+            .all()
+        )
+        query_embedding = _ollama_embed_texts([prompt])[0]
+        ranked: list[dict[str, str | float]] = []
+        for row in rows:
+            embedding = _loads_json(row.embedding_json, [])
+            vector = [float(item) for item in embedding if isinstance(item, (int, float))]
+            lexical_score = _lexical_overlap_score(prompt, row.content, row.keyword_blob or "")
+            embedding_score = _cosine_similarity(query_embedding, vector) if query_embedding and vector else 0.0
+            score = round((embedding_score * 0.8) + (lexical_score * 0.2), 6) if (query_embedding and vector) else round(lexical_score, 6)
+            if score <= 0:
+                continue
+            doc = doc_lookup.get(int(row.document_id))
+            if not doc:
+                continue
+            ranked.append(
+                {
+                    "document_id": str(row.document_id),
+                    "file_name": doc.file_name,
+                    "resource_type": doc.resource_type or "politica",
+                    "project_scope": "Base SmartLab" if doc.knowledge_scope == "smartlab" else ("Projeto atual" if doc.project_id else "Tenant"),
+                    "content": row.content,
+                    "score": score,
+                }
+            )
+        session.close()
+        ranked.sort(key=lambda item: (-float(item["score"]), item["file_name"]))
+        deduped: list[dict[str, str]] = []
+        seen_hashes: set[str] = set()
+        for item in ranked:
+            digest = sha1(f"{item['file_name']}|{item['content'][:180]}".encode("utf-8")).hexdigest()
+            if digest in seen_hashes:
+                continue
+            seen_hashes.add(digest)
+            deduped.append(
+                {
+                    "document_id": str(item["document_id"]),
+                    "file_name": str(item["file_name"]),
+                    "resource_type": str(item["resource_type"]),
+                    "project_scope": str(item["project_scope"]),
+                    "content": str(item["content"]),
+                    "score": f"{float(item['score']):.3f}",
+                }
+            )
+            if len(deduped) >= limit:
+                break
+        return deduped
+
+    def _index_assistant_document(self, session, document_row: AssistantDocumentModel) -> tuple[int, str]:
+        file_path = Path(document_row.file_path)
+        raw_text = _extract_document_text(file_path)
+        session.query(AssistantChunkModel).filter(AssistantChunkModel.document_id == int(document_row.id)).delete()
+        if not raw_text:
+            return 0, "sem_texto"
+        chunks = _chunk_text(raw_text)
+        if not chunks:
+            return 0, "sem_chunks"
+        embeddings = _ollama_embed_texts(chunks)
+        for index, chunk in enumerate(chunks):
+            vector = embeddings[index] if index < len(embeddings) else []
+            session.add(
+                AssistantChunkModel(
+                    document_id=int(document_row.id),
+                    tenant_id=document_row.tenant_id,
+                    project_id=document_row.project_id,
+                    knowledge_scope=document_row.knowledge_scope or "tenant",
+                    chunk_index=index,
+                    content=chunk,
+                    keyword_blob=_keyword_blob(chunk),
+                    embedding_json=json.dumps(vector),
+                )
+            )
+        return len(chunks), ("vetorial" if any(embeddings) else "lexical")
+
+    def _build_ai_factual_answer(self, prompt: str, insights: dict[str, Any]) -> str:
+        prompt_lower = prompt.lower()
+        asks_companies = any(term in prompt_lower for term in ["empresa", "empresas", "cliente", "clientes"])
+        asks_respondents = any(term in prompt_lower for term in ["quem respondeu", "quem delas", "quem respondeu", "respondente", "respondentes", "nomes"])
+        asks_count = any(term in prompt_lower for term in ["quantas", "quantos", "número", "numero", "total"])
+        asks_interviews = any(term in prompt_lower for term in ["entrevista", "entrevistas"])
+        asks_in_progress = any(term in prompt_lower for term in ["em andamento", "andamento", "aberta", "abertas"])
+        asks_completed = any(term in prompt_lower for term in ["conclu", "finalizada", "finalizadas"])
+
+        company_lines = [
+            f"- {item['name']}: {item['responses']} respostas; responderam {item['respondents']}"
+            for item in insights["company_breakdown"]
+        ]
+        respondent_lines = [
+            f"- {item['name']}: {item['responses']} respostas"
+            for item in insights["respondent_breakdown"]
+        ]
+        interview_company_lines = [
+            f"- {item['name']}: {item['status_count']} entrevistas ({item['statuses']})"
+            for item in insights["interview_company_breakdown"]
+        ]
+        completed_names = ", ".join(insights["completed_interviewees"]) or "nenhum"
+
+        if asks_interviews and asks_in_progress:
+            return f"Entrevistas em andamento no contexto atual: {insights['interviews_in_progress']}."
+        if asks_interviews and asks_completed and asks_companies:
+            return (
+                f"Empresas com entrevistas concluídas: {', '.join(insights['completed_companies']) or 'nenhuma'}.\n"
+                f"{chr(10).join(interview_company_lines) if interview_company_lines else 'Nenhuma entrevista concluída identificada.'}"
+            )
+        if asks_interviews and asks_completed:
+            return (
+                f"Entrevistas concluídas no contexto atual: {insights['interviews_completed']}.\n"
+                f"Entrevistados concluídos: {completed_names}."
+            )
+        if asks_interviews and asks_companies:
+            return (
+                f"Empresas com entrevistas no contexto atual: {', '.join(insights['interview_company_names']) or 'nenhuma'}.\n"
+                f"{chr(10).join(interview_company_lines) if interview_company_lines else 'Nenhum vínculo empresa-entrevista encontrado.'}"
+            )
+        if asks_interviews and asks_count:
+            return (
+                f"Total de entrevistas no contexto atual: {insights['total_interviews']}.\n"
+                f"Concluídas: {insights['interviews_completed']} | Em andamento: {insights['interviews_in_progress']}."
+            )
+
+        if asks_companies and asks_respondents:
+            return (
+                f"Empresas que responderam: {', '.join(insights['company_names']) or 'nenhuma'}.\n"
+                f"{chr(10).join(company_lines) if company_lines else 'Nenhum vínculo empresa-respondente encontrado.'}"
+            )
+        if asks_companies and asks_count:
+            return (
+                f"Total de empresas com respostas: {len(insights['company_names'])}.\n"
+                f"Empresas: {', '.join(insights['company_names']) or 'nenhuma'}."
+            )
+        if asks_companies:
+            return (
+                f"Empresas que responderam: {', '.join(insights['company_names']) or 'nenhuma'}.\n"
+                f"{chr(10).join(company_lines) if company_lines else 'Nenhuma empresa identificada.'}"
+            )
+        if asks_respondents and asks_count:
+            return (
+                f"Total de respostas: {insights['total_responses']}.\n"
+                f"{chr(10).join(respondent_lines) if respondent_lines else 'Nenhum respondente identificado.'}"
+            )
+        if asks_respondents:
+            return chr(10).join(respondent_lines) if respondent_lines else "Nenhum respondente identificado."
+        if asks_count and "respost" in prompt_lower:
+            return (
+                f"Total de respostas no contexto atual: {insights['total_responses']}.\n"
+                f"Empresas: {', '.join(insights['company_names']) or 'nenhuma'}."
+            )
+        return ""
 
     def _visible_client_ids(self, session) -> set[int] | None:
         if not (self.user_scope == "cliente" and self.user_client_id.isdigit()):
@@ -629,6 +1204,10 @@ class State(SessionStateMixin):
     def show_menu_ai(self) -> bool:
         return self.user_scope == "smartlab"
 
+    @rx.var
+    def show_menu_audit(self) -> bool:
+        return self.user_scope == "smartlab"
+
     def has_perm(self, perm: str) -> bool:
         return perm in ROLE_PERMS.get(self.user_role, set())
 
@@ -641,9 +1220,19 @@ class State(SessionStateMixin):
         rows = query.order_by(TenantModel.created_at.desc()).all()
         client_lookup = {row[0]: row[1] for row in session.query(ClientModel.id, ClientModel.name).all()}
         client_cnpj_lookup = {row[0]: row[1] or "-" for row in session.query(ClientModel.id, ClientModel.cnpj).all()}
+        document_counts: dict[str, int] = {}
+        for row in session.query(AssistantDocumentModel.tenant_id).all():
+            document_counts[row[0]] = document_counts.get(row[0], 0) + 1
+        project_counts: dict[str, int] = {}
+        for row in session.query(ProjectModel.tenant_id).all():
+            project_counts[row[0]] = project_counts.get(row[0], 0) + 1
+        form_counts: dict[str, int] = {}
+        for row in session.query(FormModel.tenant_id).all():
+            form_counts[row[0]] = form_counts.get(row[0], 0) + 1
         data = [
             {
                 "id": r.id,
+                "id_key": str(r.id),
                 "name": r.name,
                 "slug": r.slug,
                 "limit": r.limit_users,
@@ -651,11 +1240,91 @@ class State(SessionStateMixin):
                 "owner_client_name": client_lookup.get(r.owner_client_id, "SmartLab"),
                 "owner_client_cnpj": client_cnpj_lookup.get(r.owner_client_id, "-"),
                 "created_at": r.created_at.strftime("%Y-%m-%d") if r.created_at else "-",
+                "document_count": str(document_counts.get(r.id, 0)),
+                "project_count": str(project_counts.get(r.id, 0)),
+                "form_count": str(form_counts.get(r.id, 0)),
+                "client_scope_count": str(len([item for item in _loads_json(r.assigned_client_ids, []) if str(item).isdigit()])),
+                "client_scope_summary": (
+                    "SmartLab default: acesso total"
+                    if r.id == "default"
+                    else ", ".join(
+                        client_lookup.get(int(item), str(item))
+                        for item in _loads_json(r.assigned_client_ids, [])
+                        if str(item).isdigit()
+                    ) or client_lookup.get(r.owner_client_id, "Cliente principal")
+                ),
             }
             for r in rows
         ]
         session.close()
         return data
+
+    @rx.var
+    def ollama_models_data(self) -> list[dict[str, str]]:
+        return _parse_ollama_list(_run_ollama_command("list"))
+
+    @rx.var
+    def ai_model_options(self) -> list[str]:
+        return [row["name"] for row in self.ollama_models_data]
+
+    @rx.var
+    def ai_selected_model_effective(self) -> str:
+        if self.ai_selected_model and self.ai_selected_model in self.ai_model_options:
+            return self.ai_selected_model
+        preferred = "llama3:8b-instruct-q8_0"
+        if preferred in self.ai_model_options:
+            return preferred
+        return self.ai_model_options[0] if self.ai_model_options else "Nenhum modelo local disponível"
+
+    @rx.var
+    def ai_runtime_status(self) -> dict[str, str]:
+        version_output = _run_ollama_command("--version")
+        status = "online" if self.ollama_models_data else "sem modelos"
+        if not version_output:
+            status = "offline"
+        return {
+            "engine": "Ollama local",
+            "version": version_output or "indisponível",
+            "status": status,
+            "models": str(len(self.ollama_models_data)),
+            "default_model": self.ai_selected_model_effective,
+        }
+
+    @rx.var
+    def ai_resource_type_options(self) -> list[str]:
+        return ["politica", "procedimento", "evidencia", "comentario", "relatorio"]
+
+    @rx.var
+    def ai_knowledge_scope_options(self) -> list[str]:
+        options = ["tenant"]
+        if self.user_scope == "smartlab":
+            options.append("smartlab")
+        return options
+
+    @rx.var
+    def ai_knowledge_scope_effective(self) -> str:
+        if self.ai_knowledge_scope == "smartlab" and self.user_scope == "smartlab":
+            return "smartlab"
+        return "tenant"
+
+    @rx.var
+    def ai_scope_options(self) -> list[str]:
+        options = ["tenant"]
+        if self.selected_project_id and self.selected_project_id.isdigit():
+            options.append("projeto")
+        return options
+
+    @rx.var
+    def ai_scope_mode_effective(self) -> str:
+        if self.ai_scope_mode == "projeto" and self.selected_project_id and self.selected_project_id.isdigit():
+            return "projeto"
+        return "tenant"
+
+    @rx.var
+    def ai_selected_project_label(self) -> str:
+        if self.ai_scope_mode_effective != "projeto":
+            return "Projeto desativado no Assistente"
+        return self.selected_project_option or "Projeto não selecionado"
 
     @rx.var(cache=False)
     def clients_data(self) -> list[dict[str, Any]]:
@@ -827,6 +1496,19 @@ class State(SessionStateMixin):
         name = self.client_lookup.get(self.new_tenant_client_id, "")
         return f"{self.new_tenant_client_id} - {name}" if name else ""
 
+    @rx.var
+    def selected_tenant_assigned_clients_summary(self) -> str:
+        if self.new_tenant_slug == "default":
+            return "SmartLab default: acesso total e irrestrito"
+        if not self.new_tenant_assigned_client_ids:
+            return "Clique para escolher os clientes do tenant"
+        names = [
+            self.client_lookup.get(client_id, client_id)
+            for client_id in self.new_tenant_assigned_client_ids
+        ]
+        expanded_count = len(self._expand_client_scope(self.new_tenant_assigned_client_ids))
+        return f"{', '.join(names)} (escopo efetivo: {expanded_count} cliente(s))"
+
     @rx.var(cache=False)
     def business_sector_options(self) -> list[str]:
         base_options = ["Industria", "Servicos", "Varejo", "Logistica"]
@@ -842,7 +1524,8 @@ class State(SessionStateMixin):
             if row[0] and row[0].strip()
         ]
         session.close()
-        dynamic_options = sorted({option for option in custom_options if option not in base_options})
+        catalog_options = self._catalog_options("business_sector")
+        dynamic_options = sorted({option for option in [*custom_options, *catalog_options] if option not in base_options})
         return [*base_options, *dynamic_options, "Outro"]
 
     @rx.var
@@ -887,7 +1570,8 @@ class State(SessionStateMixin):
             if row[0] and row[0].strip()
         ]
         session.close()
-        dynamic_options = sorted({option for option in custom_options if option not in base_options})
+        catalog_options = self._catalog_options("question_dimension")
+        dynamic_options = sorted({option for option in [*custom_options, *catalog_options] if option not in base_options})
         return [*base_options, *dynamic_options, "Outro"]
 
     @rx.var
@@ -1022,13 +1706,37 @@ class State(SessionStateMixin):
     def user_scope_options(self) -> list[str]:
         return ["smartlab", "cliente"]
 
-    @rx.var
+    @rx.var(cache=False)
     def profession_options(self) -> list[str]:
-        return ["Analista", "Motorista", "Coordenador", "Supervisor", "Gerente", "Diretor", "CEO", "Outro"]
+        base_options = ["Analista", "Motorista", "Coordenador", "Supervisor", "Gerente", "Diretor", "CEO"]
+        session = SessionLocal()
+        values = [
+            str(row[0]).strip()
+            for row in session.query(UserModel.profession)
+            .filter(UserModel.profession.is_not(None))
+            .all()
+            if row[0] and str(row[0]).strip()
+        ]
+        session.close()
+        catalog_options = self._catalog_options("user_profession")
+        dynamic_options = sorted({option for option in [*values, *catalog_options] if option not in base_options})
+        return [*base_options, *dynamic_options, "Outro"]
 
-    @rx.var
+    @rx.var(cache=False)
     def department_options(self) -> list[str]:
-        return ["RH", "Operacao", "Logistica", "Vendas", "Marketing", "Outro"]
+        base_options = ["RH", "Operacao", "Logistica", "Vendas", "Marketing"]
+        session = SessionLocal()
+        values = [
+            str(row[0]).strip()
+            for row in session.query(UserModel.department)
+            .filter(UserModel.department.is_not(None))
+            .all()
+            if row[0] and str(row[0]).strip()
+        ]
+        session.close()
+        catalog_options = self._catalog_options("user_department")
+        dynamic_options = sorted({option for option in [*values, *catalog_options] if option not in base_options})
+        return [*base_options, *dynamic_options, "Outro"]
 
     @rx.var
     def selected_assigned_clients_summary(self) -> str:
@@ -1177,8 +1885,15 @@ class State(SessionStateMixin):
                 "id": r.id,
                 "name": r.name,
                 "category": r.service_name,
+                "stage": r.stage_name or "Visita Técnica - Guiada",
                 "dimensions": ", ".join(dimension_lookup.get(int(r.id), [])) or "-",
+                "has_dim_presenca": "1" if "Presença" in dimension_lookup.get(int(r.id), []) else "0",
+                "has_dim_correcao": "1" if "Correção" in dimension_lookup.get(int(r.id), []) else "0",
+                "has_dim_reconhecimento": "1" if "Reconhecimento" in dimension_lookup.get(int(r.id), []) else "0",
+                "has_dim_comunicacao": "1" if "Comunicação" in dimension_lookup.get(int(r.id), []) else "0",
+                "has_dim_disciplina": "1" if "Disciplina/Exemplo" in dimension_lookup.get(int(r.id), []) else "0",
                 "question_count": str(question_counts.get(int(r.id), 0)),
+                "has_questions": "1" if question_counts.get(int(r.id), 0) > 0 else "0",
                 "share_link": f'/form/{r.id}?token={r.share_token or ""}',
             }
             for r in rows
@@ -1192,11 +1907,20 @@ class State(SessionStateMixin):
 
     @rx.var(cache=False)
     def survey_builder_options(self) -> list[str]:
-        return [f'{form["id"]} - {form["name"]}' for form in self.forms_data]
+        return [f'{form["id"]} - {form["name"]} [{form["stage"]}]' for form in self.forms_data]
 
     @rx.var(cache=False)
     def interview_form_options(self) -> list[str]:
-        return [f'{form["id"]} - {form["name"]} ({form["category"]})' for form in self.forms_data]
+        target_service = ""
+        if self.new_interview_project_id.isdigit():
+            for item in self.projects_data:
+                if str(item["id"]) == self.new_interview_project_id:
+                    target_service = str(item.get("service_name") or "").strip()
+                    break
+        forms = self.forms_data
+        if target_service:
+            forms = [form for form in forms if str(form.get("category") or "").strip() == target_service]
+        return [f'{form["id"]} - {form["name"]} ({form["category"]} | {form["stage"]})' for form in forms]
 
     @rx.var
     def selected_form_name(self) -> str:
@@ -1204,7 +1928,7 @@ class State(SessionStateMixin):
             return ""
         for form in self.forms_data:
             if str(form["id"]) == self.selected_form_id:
-                return form["name"]
+                return f'{form["name"]} | {form["stage"]}'
         return ""
 
     @rx.var
@@ -1213,28 +1937,152 @@ class State(SessionStateMixin):
             return ""
         for form in self.forms_data:
             if str(form["id"]) == self.selected_form_id:
-                return f'{form["id"]} - {form["name"]}'
+                return f'{form["id"]} - {form["name"]} [{form["stage"]}]'
         return ""
 
-    @rx.var
+    @rx.var(cache=False)
     def selected_interview_form_option(self) -> str:
         if not self.new_interview_form_id:
             return ""
         for form in self.forms_data:
             if str(form["id"]) == self.new_interview_form_id:
-                return f'{form["id"]} - {form["name"]} ({form["category"]})'
+                return f'{form["id"]} - {form["name"]} ({form["category"]} | {form["stage"]})'
         return ""
 
-    @rx.var
-    def interview_client_options(self) -> list[str]:
-        return [f"{client_id} - {name}" for client_id, name in self.client_lookup.items()]
-
-    @rx.var
+    @rx.var(cache=False)
     def selected_interview_client_option(self) -> str:
         if not self.new_interview_client_id:
             return ""
         name = self.client_lookup.get(self.new_interview_client_id, "")
         return f"{self.new_interview_client_id} - {name}" if name else ""
+
+    @rx.var(cache=False)
+    def selected_interview_client_name(self) -> str:
+        if self.new_interview_project_id.isdigit():
+            session = SessionLocal()
+            row = (
+                session.query(ClientModel.name)
+                .join(ProjectModel, ProjectModel.client_id == ClientModel.id)
+                .filter(
+                    ProjectModel.id == int(self.new_interview_project_id),
+                    ProjectModel.tenant_id == self.current_tenant,
+                )
+                .first()
+            )
+            session.close()
+            if row and row[0]:
+                return str(row[0]).strip()
+        if not self.new_interview_client_id:
+            return "-"
+        name = self.client_lookup.get(self.new_interview_client_id, "").strip()
+        if name:
+            return name
+        session = SessionLocal()
+        row = session.query(ClientModel.name).filter(ClientModel.id == int(self.new_interview_client_id)).first()
+        session.close()
+        return str(row[0]).strip() if row and row[0] else "-"
+
+    @rx.var(cache=False)
+    def selected_interview_stage_name(self) -> str:
+        if not self.new_interview_form_id:
+            return "-"
+        for form in self.forms_data:
+            if str(form["id"]) == self.new_interview_form_id:
+                return str(form.get("stage") or "-")
+        session = SessionLocal()
+        row = session.query(SurveyModel.stage_name).filter(SurveyModel.id == int(self.new_interview_form_id)).first()
+        session.close()
+        if row and row[0]:
+            return str(row[0]).strip()
+        return "-"
+
+    @rx.var(cache=False)
+    def interview_inline_form_options(self) -> list[str]:
+        target_service = ""
+        if self.edit_interview_project_id.isdigit():
+            session = SessionLocal()
+            row = (
+                session.query(ProjectModel.service_name)
+                .filter(
+                    ProjectModel.id == int(self.edit_interview_project_id),
+                    ProjectModel.tenant_id == self.current_tenant,
+                )
+                .first()
+            )
+            session.close()
+            target_service = str(row[0] or "").strip() if row and row[0] else ""
+        forms = self.forms_data
+        if target_service:
+            forms = [form for form in forms if str(form.get("category") or "").strip() == target_service]
+        return [f'{form["id"]} - {form["name"]} ({form["category"]} | {form["stage"]})' for form in forms]
+
+    @rx.var(cache=False)
+    def selected_edit_interview_form_option(self) -> str:
+        if not self.edit_interview_form_id:
+            return ""
+        for form in self.forms_data:
+            if str(form["id"]) == self.edit_interview_form_id:
+                return f'{form["id"]} - {form["name"]} ({form["category"]} | {form["stage"]})'
+        return ""
+
+    @rx.var(cache=False)
+    def selected_edit_interview_project_option(self) -> str:
+        if not self.edit_interview_project_id:
+            return ""
+        for item in self.projects_data:
+            if str(item["id"]) == self.edit_interview_project_id:
+                return f'{item["id"]} - {item["name"]}'
+        return ""
+
+    @rx.var(cache=False)
+    def selected_edit_interview_client_name(self) -> str:
+        if self.edit_interview_client_id:
+            name = self.client_lookup.get(self.edit_interview_client_id, "").strip()
+            if name:
+                return name
+        if self.edit_interview_project_id.isdigit():
+            session = SessionLocal()
+            row = (
+                session.query(ClientModel.name)
+                .join(ProjectModel, ProjectModel.client_id == ClientModel.id)
+                .filter(
+                    ProjectModel.id == int(self.edit_interview_project_id),
+                    ProjectModel.tenant_id == self.current_tenant,
+                )
+                .first()
+            )
+            session.close()
+            if row and row[0]:
+                return str(row[0]).strip()
+        return "-"
+
+    @rx.var(cache=False)
+    def selected_edit_interview_stage_name(self) -> str:
+        if not self.edit_interview_form_id:
+            return "-"
+        for form in self.forms_data:
+            if str(form["id"]) == self.edit_interview_form_id:
+                return str(form.get("stage") or "-")
+        session = SessionLocal()
+        row = session.query(SurveyModel.stage_name).filter(SurveyModel.id == int(self.edit_interview_form_id)).first()
+        session.close()
+        return str(row[0]).strip() if row and row[0] else "-"
+
+    @rx.var
+    def interview_status_options(self) -> list[str]:
+        return ["em_andamento", "concluida"]
+
+    @rx.var(cache=False)
+    def is_new_interview_leadership_stage(self) -> bool:
+        return self.selected_interview_stage_name == "Entrevista Individual com o Líder"
+
+    @rx.var(cache=False)
+    def is_new_interview_group_stage(self) -> bool:
+        return self.selected_interview_stage_name == "Rodas de Conversa"
+
+    @rx.var(cache=False)
+    def is_new_interview_visit_stage(self) -> bool:
+        return self.selected_interview_stage_name == "Visita Técnica - Guiada"
 
     @rx.var(cache=False)
     def interview_user_options(self) -> list[str]:
@@ -1257,19 +2105,169 @@ class State(SessionStateMixin):
         ]
 
     @rx.var(cache=False)
+    def active_interview_client_id(self) -> str:
+        if not self.selected_interview_id.isdigit():
+            return self.new_interview_client_id if self.interview_draft_active else ""
+        session = SessionLocal()
+        row = (
+            session.query(InterviewSessionModel.client_id)
+            .filter(
+                InterviewSessionModel.id == int(self.selected_interview_id),
+                InterviewSessionModel.tenant_id == self.current_tenant,
+            )
+            .first()
+        )
+        session.close()
+        return str(row[0]) if row and row[0] is not None else ""
+
+    @rx.var(cache=False)
+    def active_interview_user_options(self) -> list[str]:
+        if not self.active_interview_client_id.isdigit():
+            return []
+        session = SessionLocal()
+        rows = (
+            session.query(UserModel.id, UserModel.name, UserModel.email, UserModel.profession)
+            .filter(
+                UserModel.account_scope == "cliente",
+                UserModel.client_id == int(self.active_interview_client_id),
+            )
+            .order_by(UserModel.name.asc())
+            .all()
+        )
+        session.close()
+        return [f'{row[0]} - {row[1] or row[2]} ({row[3] or "Sem cargo"})' for row in rows]
+
+    @rx.var(cache=False)
     def selected_interview_user_option(self) -> str:
-        if not self.new_interview_user_id.isdigit():
+        target_user_id = self.new_interview_user_id
+        if not target_user_id.isdigit():
+            target_user_id = self.selected_interview_record.get("id", "")
+            if self.selected_interview_id.isdigit():
+                session = SessionLocal()
+                interview_row = (
+                    session.query(InterviewSessionModel.interviewee_user_id)
+                    .filter(
+                        InterviewSessionModel.id == int(self.selected_interview_id),
+                        InterviewSessionModel.tenant_id == self.current_tenant,
+                    )
+                    .first()
+                )
+                session.close()
+                target_user_id = str(interview_row[0]) if interview_row and interview_row[0] is not None else ""
+        if not target_user_id.isdigit():
             return ""
         session = SessionLocal()
         row = (
             session.query(UserModel.id, UserModel.name, UserModel.email, UserModel.profession)
-            .filter(UserModel.id == int(self.new_interview_user_id))
+            .filter(UserModel.id == int(target_user_id))
             .first()
         )
         session.close()
         if not row:
             return ""
         return f'{row[0]} - {row[1] or row[2]} ({row[3] or "Sem cargo"})'
+
+    @rx.var(cache=False)
+    def interview_area_options(self) -> list[str]:
+        if not self.new_interview_client_id.isdigit():
+            return []
+        session = SessionLocal()
+        rows = (
+            session.query(UserModel.department)
+            .filter(
+                UserModel.account_scope == "cliente",
+                UserModel.client_id == int(self.new_interview_client_id),
+                UserModel.department.is_not(None),
+            )
+            .all()
+        )
+        session.close()
+        values = sorted({str(row[0]).strip() for row in rows if row[0] and str(row[0]).strip()})
+        values.extend(option for option in self._catalog_options("user_department") if option not in values)
+        return values
+
+    @rx.var(cache=False)
+    def active_interview_area_options(self) -> list[str]:
+        client_id = self.active_interview_client_id
+        if not client_id.isdigit():
+            return []
+        session = SessionLocal()
+        rows = (
+            session.query(UserModel.department)
+            .filter(
+                UserModel.account_scope == "cliente",
+                UserModel.client_id == int(client_id),
+                UserModel.department.is_not(None),
+            )
+            .all()
+        )
+        session.close()
+        values = sorted({str(row[0]).strip() for row in rows if row[0] and str(row[0]).strip()})
+        values.extend(option for option in self._catalog_options("user_department") if option not in values)
+        return values
+
+    @rx.var(cache=False)
+    def selected_interview_area_option(self) -> str:
+        if self.new_interview_area:
+            return self.new_interview_area
+        return self.selected_interview_record.get("target_area", "")
+
+    @rx.var(cache=False)
+    def active_interview_group_name(self) -> str:
+        if self.new_interview_group_name:
+            return self.new_interview_group_name
+        return self.selected_interview_record.get("audience_group", "")
+
+    @rx.var(cache=False)
+    def active_interview_requires_user(self) -> bool:
+        return self.selected_interview_record["stage_name"] == "Entrevista Individual com o Líder"
+
+    @rx.var(cache=False)
+    def active_interview_is_group_stage(self) -> bool:
+        return self.selected_interview_record["stage_name"] in {"Rodas de Conversa", "Rodada de Conversa"}
+
+    @rx.var(cache=False)
+    def active_interview_is_visit_stage(self) -> bool:
+        return self.selected_interview_record["stage_name"] == "Visita Técnica - Guiada"
+
+    @rx.var(cache=False)
+    def active_interview_context_ready(self) -> bool:
+        if not self.selected_interview_id.isdigit():
+            if not self.interview_draft_active:
+                return False
+            stage_name = self.selected_interview_stage_name
+            if stage_name == "Entrevista Individual com o Líder":
+                return self.new_interview_user_id.isdigit()
+            if stage_name == "Visita Técnica - Guiada":
+                return bool(self.new_interview_area.strip())
+            if stage_name in {"Rodas de Conversa", "Rodada de Conversa"}:
+                return bool(self.new_interview_area.strip() and self.new_interview_group_name.strip())
+            return False
+        session = SessionLocal()
+        interview = (
+            session.query(InterviewSessionModel)
+            .filter(
+                InterviewSessionModel.id == int(self.selected_interview_id),
+                InterviewSessionModel.tenant_id == self.current_tenant,
+            )
+            .first()
+        )
+        if not interview:
+            session.close()
+            return False
+        survey = None
+        if interview.survey_id is not None:
+            survey = session.query(SurveyModel).filter(SurveyModel.id == int(interview.survey_id)).first()
+        stage_name = survey.stage_name if survey and survey.stage_name else self.selected_interview_record["stage_name"]
+        ready = True
+        if stage_name == "Entrevista Individual com o Líder":
+            ready = interview.interviewee_user_id is not None
+        elif stage_name == "Visita Técnica - Guiada":
+            ready = bool(str(interview.target_area or "").strip())
+        elif stage_name in {"Rodas de Conversa", "Rodada de Conversa"}:
+            ready = bool(str(interview.target_area or "").strip() and str(interview.audience_group or "").strip())
+        session.close()
+        return ready
 
     @rx.var(cache=False)
     def interview_sessions_data(self) -> list[dict[str, str]]:
@@ -1282,7 +2280,13 @@ class State(SessionStateMixin):
             .order_by(InterviewSessionModel.created_at.desc())
             .all()
         )
-        survey_lookup = {str(row.id): row.name for row in session.query(SurveyModel).filter(SurveyModel.tenant_id == self.current_tenant).all()}
+        survey_lookup = {
+            str(row.id): {
+                "name": row.name,
+                "stage": row.stage_name or "Visita Técnica - Guiada",
+            }
+            for row in session.query(SurveyModel).filter(SurveyModel.tenant_id == self.current_tenant).all()
+        }
         project_lookup = {str(row.id): row.name for row in session.query(ProjectModel).filter(ProjectModel.tenant_id == self.current_tenant).all()}
         client_lookup = {str(row.id): row.name for row in session.query(ClientModel).all()}
         user_lookup = {str(row.id): {"name": row.name or row.email, "email": row.email} for row in session.query(UserModel).all()}
@@ -1301,12 +2305,18 @@ class State(SessionStateMixin):
         data = [
             {
                 "id": str(row.id),
-                "form_name": survey_lookup.get(str(row.survey_id), f"Pesquisa {row.survey_id or '-'}"),
+                "survey_id": str(row.survey_id or ""),
+                "project_id": str(row.project_id or ""),
+                "client_id": str(row.client_id or ""),
+                "form_name": survey_lookup.get(str(row.survey_id), {}).get("name", f"Pesquisa {row.survey_id or '-'}"),
+                "stage_name": survey_lookup.get(str(row.survey_id), {}).get("stage", "-"),
                 "project_name": project_lookup.get(str(row.project_id), "-") if row.project_id is not None else "-",
                 "client_name": client_lookup.get(str(row.client_id), "-") if row.client_id is not None else "-",
                 "interviewee_name": row.interviewee_name or "-",
                 "interviewee_role": row.interviewee_role or "-",
                 "interviewee_email": user_lookup.get(str(row.interviewee_user_id), {}).get("email", "-") if row.interviewee_user_id is not None else "-",
+                "target_area": row.target_area or "-",
+                "audience_group": row.audience_group or "-",
                 "consultant_name": row.consultant_name or "-",
                 "interview_date": row.interview_date or "-",
                 "status": row.status or "em_andamento",
@@ -1320,15 +2330,62 @@ class State(SessionStateMixin):
 
     @rx.var(cache=False)
     def selected_interview_record(self) -> dict[str, str]:
+        if not self.selected_interview_id and self.interview_draft_active:
+            stage_name = self.selected_interview_stage_name
+            interviewee_name = "-"
+            interviewee_role = "-"
+            if stage_name == "Entrevista Individual com o Líder" and self.new_interview_user_id.isdigit():
+                session = SessionLocal()
+                row = (
+                    session.query(UserModel.name, UserModel.email, UserModel.profession, UserModel.department)
+                    .filter(UserModel.id == int(self.new_interview_user_id))
+                    .first()
+                )
+                session.close()
+                if row:
+                    interviewee_name = row[0] or row[1] or "-"
+                    interviewee_role = row[2] or row[3] or "-"
+            elif stage_name in {"Rodas de Conversa", "Rodada de Conversa"}:
+                interviewee_name = self.new_interview_group_name.strip() or "Grupo pendente"
+                interviewee_role = self.new_interview_area.strip() or "Área pendente"
+            elif stage_name == "Visita Técnica - Guiada":
+                interviewee_name = f"Área: {self.new_interview_area.strip()}" if self.new_interview_area.strip() else "Área pendente"
+                interviewee_role = "Observação em campo"
+            return {
+                "id": "",
+                "survey_id": self.new_interview_form_id,
+                "project_id": self.new_interview_project_id,
+                "client_id": self.new_interview_client_id,
+                "form_name": self.selected_interview_form_option or "Entrevista em preparação",
+                "project_name": self.selected_interview_project_option.split(" - ", 1)[1] if " - " in self.selected_interview_project_option else "-",
+                "client_name": self.selected_interview_client_name,
+                "stage_name": stage_name,
+                "interviewee_name": interviewee_name,
+                "interviewee_role": interviewee_role,
+                "interviewee_email": "-",
+                "target_area": self.new_interview_area or "-",
+                "audience_group": self.new_interview_group_name or "-",
+                "consultant_name": self.login_email.strip().lower() or "-",
+                "interview_date": self.new_interview_date or "-",
+                "status": "rascunho",
+                "responses": "0",
+                "total_score": "0",
+            }
         if not self.selected_interview_id:
             return {
                 "id": "",
+                "survey_id": "",
+                "project_id": "",
+                "client_id": "",
                 "form_name": "Nenhuma entrevista selecionada",
                 "project_name": "-",
                 "client_name": "-",
+                "stage_name": "-",
                 "interviewee_name": "-",
                 "interviewee_role": "-",
                 "interviewee_email": "-",
+                "target_area": "-",
+                "audience_group": "-",
                 "consultant_name": "-",
                 "interview_date": "-",
                 "status": "-",
@@ -1340,12 +2397,18 @@ class State(SessionStateMixin):
                 return item
         return {
             "id": "",
+            "survey_id": "",
+            "project_id": "",
+            "client_id": "",
             "form_name": "Entrevista nao encontrada",
             "project_name": "-",
             "client_name": "-",
+            "stage_name": "-",
             "interviewee_name": "-",
             "interviewee_role": "-",
             "interviewee_email": "-",
+            "target_area": "-",
+            "audience_group": "-",
             "consultant_name": "-",
             "interview_date": "-",
             "status": "-",
@@ -1372,6 +2435,7 @@ class State(SessionStateMixin):
         data = [
             {
                 "id": r.id,
+                "id_key": str(r.id),
                 "text": r.text,
                 "qtype": _loads_json(r.qtype, {"kind": r.qtype}).get("kind", "texto") if str(r.qtype).startswith("{") else r.qtype,
                 "dimension": r.dimension or "-",
@@ -1438,34 +2502,41 @@ class State(SessionStateMixin):
 
     @rx.var(cache=False)
     def active_interview_questions(self) -> list[dict[str, str]]:
-        if not self.selected_interview_id.isdigit():
-            return []
-        session = SessionLocal()
-        interview = (
-            session.query(InterviewSessionModel)
-            .filter(
-                InterviewSessionModel.id == int(self.selected_interview_id),
-                InterviewSessionModel.tenant_id == self.current_tenant,
+        survey_id = None
+        if self.selected_interview_id.isdigit():
+            session = SessionLocal()
+            interview = (
+                session.query(InterviewSessionModel)
+                .filter(
+                    InterviewSessionModel.id == int(self.selected_interview_id),
+                    InterviewSessionModel.tenant_id == self.current_tenant,
+                )
+                .first()
             )
-            .first()
-        )
-        if not interview:
-            session.close()
-            return []
-        response_rows = (
-            session.query(ResponseModel)
-            .filter(
-                ResponseModel.tenant_id == self.current_tenant,
-                ResponseModel.interview_id == interview.id,
+            if not interview:
+                session.close()
+                return []
+            survey_id = int(interview.survey_id or 0)
+            response_rows = (
+                session.query(ResponseModel)
+                .filter(
+                    ResponseModel.tenant_id == self.current_tenant,
+                    ResponseModel.interview_id == interview.id,
+                )
+                .all()
             )
-            .all()
-        )
+        elif self.interview_draft_active and self.new_interview_form_id.isdigit():
+            session = SessionLocal()
+            survey_id = int(self.new_interview_form_id)
+            response_rows = []
+        else:
+            return []
         response_lookup = {int(row.question_id): row for row in response_rows}
         questions = (
             session.query(QuestionModel)
             .filter(
                 QuestionModel.tenant_id == self.current_tenant,
-                QuestionModel.survey_id == int(interview.survey_id or 0),
+                QuestionModel.survey_id == int(survey_id or 0),
             )
             .order_by(QuestionModel.id.asc())
             .all()
@@ -1482,6 +2553,8 @@ class State(SessionStateMixin):
             score = self.interview_score_map.get(str(question.id))
             if score is None:
                 score = str(stored_response.score) if stored_response and stored_response.score is not None else "0"
+            score_touched = str(question.id) in self.interview_score_touched_ids or stored_response is not None
+            is_answered = "1" if score_touched else "0"
             data.append(
                 {
                     "id": str(question.id),
@@ -1494,7 +2567,7 @@ class State(SessionStateMixin):
                     "logic_rule": str(payload["logic"].get("show_if", "")) or "Sempre visivel",
                     "answer": answer,
                     "score": score,
-                    "is_answered": "1" if stored_response is not None or has_local_score or has_local_answer else "0",
+                    "is_answered": is_answered,
                 }
             )
         session.close()
@@ -1611,18 +2684,44 @@ class State(SessionStateMixin):
             assignment_lookup.setdefault(int(project_id), [])
             if client_id is not None:
                 assignment_lookup[int(project_id)].append(str(client_id))
+        interview_counts: dict[int, int] = {}
+        for row in session.query(InterviewSessionModel.project_id).filter(InterviewSessionModel.project_id.is_not(None)).all():
+            if row[0] is not None:
+                interview_counts[int(row[0])] = interview_counts.get(int(row[0]), 0) + 1
+        action_counts: dict[int, int] = {}
+        for row in session.query(ActionPlanModel.project_id).filter(ActionPlanModel.project_id.is_not(None)).all():
+            if row[0] is not None:
+                action_counts[int(row[0])] = action_counts.get(int(row[0]), 0) + 1
+        workflow_counts: dict[int, int] = {}
+        for row in session.query(WorkflowBoxModel.project_id).filter(WorkflowBoxModel.project_id.is_not(None)).all():
+            if row[0] is not None:
+                workflow_counts[int(row[0])] = workflow_counts.get(int(row[0]), 0) + 1
+        knowledge_counts: dict[int, int] = {}
+        for row in session.query(AssistantDocumentModel.project_id).filter(AssistantDocumentModel.project_id.is_not(None)).all():
+            if row[0] is not None:
+                knowledge_counts[int(row[0])] = knowledge_counts.get(int(row[0]), 0) + 1
         data = [
             {
                 "id": r.id,
+                "id_key": str(r.id),
                 "name": r.name,
                 "project_type": r.project_type,
+                "service_name": r.service_name or "Diagnóstico Cultura de Segurança",
+                "client_id": str(r.client_id) if r.client_id is not None else "",
+                "client_name": self.client_lookup.get(str(r.client_id), "-") if r.client_id is not None else "-",
+                "contracted_at": r.contracted_at or "-",
                 "status": r.status,
                 "progress": r.progress,
                 "source_tenant": r.tenant_id,
+                "assigned_client_ids": assignment_lookup.get(r.id, []),
                 "assigned_clients": ", ".join(
                     self.client_lookup.get(client_id, client_id)
                     for client_id in assignment_lookup.get(r.id, [])
                 ) or "-",
+                "interview_count": str(interview_counts.get(int(r.id), 0)),
+                "action_count": str(action_counts.get(int(r.id), 0)),
+                "workflow_count": str(workflow_counts.get(int(r.id), 0)),
+                "knowledge_count": str(knowledge_counts.get(int(r.id), 0)),
             }
             for r in rows
         ]
@@ -1632,6 +2731,21 @@ class State(SessionStateMixin):
     @rx.var
     def project_id_options(self) -> list[str]:
         return [f'{p["id"]} - {p["name"]}' for p in self.projects_data]
+
+    @rx.var(cache=False)
+    def project_portfolio_service_options(self) -> list[str]:
+        services = sorted({str(item.get("service_name") or "").strip() for item in self.projects_data if str(item.get("service_name") or "").strip()})
+        return ["Todos", *services]
+
+    @rx.var(cache=False)
+    def filtered_projects_data(self) -> list[dict[str, Any]]:
+        if self.project_portfolio_service_filter == "Todos":
+            return self.projects_data
+        return [
+            item
+            for item in self.projects_data
+            if str(item.get("service_name") or "").strip() == self.project_portfolio_service_filter
+        ]
 
     @rx.var(cache=False)
     def selected_project_option(self) -> str:
@@ -1645,6 +2759,85 @@ class State(SessionStateMixin):
     @rx.var
     def can_configure_projects(self) -> bool:
         return self.user_scope == "smartlab" and self.current_tenant == "default"
+
+    @rx.var(cache=False)
+    def smartlab_service_options(self) -> list[str]:
+        session = SessionLocal()
+        names: set[str] = {"Diagnóstico Cultura de Segurança"}
+        for row in session.query(SurveyModel.service_name).all():
+            if row[0]:
+                names.add(str(row[0]).strip())
+        for row in session.query(ProjectModel.service_name).all():
+            if row[0]:
+                names.add(str(row[0]).strip())
+        for row in session.query(ActionPlanModel.service_name).all():
+            if row[0]:
+                names.add(str(row[0]).strip())
+        session.close()
+        names.update(self._catalog_options("smartlab_service"))
+        dynamic_options = [name for name in sorted(names) if name and name != "Diagnóstico Cultura de Segurança"]
+        return ["Diagnóstico Cultura de Segurança", "Outro", *dynamic_options]
+
+    @rx.var
+    def effective_new_form_service_name(self) -> str:
+        if self.new_form_custom_category.strip():
+            return self.new_form_custom_category.strip()
+        if self.new_form_category == "Outro":
+            return self.new_form_custom_category.strip() or "Diagnóstico Cultura de Segurança"
+        return self.new_form_category
+
+    @rx.var
+    def effective_new_project_service_name(self) -> str:
+        if self.new_project_custom_service_name.strip():
+            return self.new_project_custom_service_name.strip()
+        if self.new_project_service_name == "Outro":
+            return self.new_project_custom_service_name.strip() or "Diagnóstico Cultura de Segurança"
+        return self.new_project_service_name
+
+    @rx.var(cache=False)
+    def survey_stage_options(self) -> list[str]:
+        session = SessionLocal()
+        names = {
+            "Visita Técnica - Guiada",
+            "Entrevista Individual com o Líder",
+            "Rodas de Conversa",
+        }
+        for row in session.query(SurveyModel.stage_name).all():
+            if row[0]:
+                names.add(str(row[0]).strip())
+        session.close()
+        names.update(self._catalog_options("survey_stage"))
+        dynamic_options = [
+            name
+            for name in sorted(names)
+            if name and name not in {"Visita Técnica - Guiada", "Entrevista Individual com o Líder", "Rodas de Conversa"}
+        ]
+        return [
+            "Visita Técnica - Guiada",
+            "Entrevista Individual com o Líder",
+            "Rodas de Conversa",
+            "Outra",
+            *dynamic_options,
+        ]
+
+    @rx.var
+    def effective_new_form_stage_name(self) -> str:
+        if self.new_form_custom_stage.strip():
+            return self.new_form_custom_stage.strip()
+        if self.new_form_stage == "Outra":
+            return "Visita Técnica - Guiada"
+        return self.new_form_stage
+
+    @rx.var(cache=False)
+    def project_client_options(self) -> list[str]:
+        return [f'{item["id"]} - {item["name"]}' for item in self.clients_data]
+
+    @rx.var
+    def selected_project_client_option(self) -> str:
+        if not self.new_project_client_id:
+            return ""
+        name = self.client_lookup.get(self.new_project_client_id, "")
+        return f"{self.new_project_client_id} - {name}" if name else ""
 
     @rx.var
     def selected_project_assigned_clients_summary(self) -> str:
@@ -1667,7 +2860,7 @@ class State(SessionStateMixin):
 
     @rx.var
     def project_admin_tabs(self) -> list[str]:
-        return ["cadastro", "workflow"]
+        return ["cadastro", "projetos", "workflow"]
 
     @rx.var(cache=False)
     def selected_project_record(self) -> dict[str, str]:
@@ -1675,6 +2868,9 @@ class State(SessionStateMixin):
             return {
                 "name": "Nenhum projeto selecionado",
                 "type": "-",
+                "service_name": "-",
+                "client_name": "-",
+                "contracted_at": "-",
                 "status": "-",
                 "progress": "0",
                 "clients": "-",
@@ -1684,6 +2880,9 @@ class State(SessionStateMixin):
                 return {
                     "name": item["name"],
                     "type": item["project_type"],
+                    "service_name": item["service_name"],
+                    "client_name": item["client_name"],
+                    "contracted_at": item["contracted_at"],
                     "status": item["status"],
                     "progress": str(item["progress"]),
                     "clients": item["assigned_clients"],
@@ -1691,10 +2890,35 @@ class State(SessionStateMixin):
         return {
             "name": "Projeto nao encontrado",
             "type": "-",
+            "service_name": "-",
+            "client_name": "-",
+            "contracted_at": "-",
             "status": "-",
             "progress": "0",
             "clients": "-",
         }
+
+    @rx.var(cache=False)
+    def interview_project_options(self) -> list[str]:
+        return [f'{item["id"]} - {item["name"]}' for item in self.projects_data]
+
+    @rx.var(cache=False)
+    def selected_interview_project_option(self) -> str:
+        if not self.new_interview_project_id:
+            return ""
+        for item in self.projects_data:
+            if str(item["id"]) == self.new_interview_project_id:
+                return f'{item["id"]} - {item["name"]}'
+        return ""
+
+    @rx.var
+    def selected_project_plan_context(self) -> str:
+        project = self.selected_project_record
+        return (
+            f"{project.get('service_name', '-')} | "
+            f"Cliente: {project.get('client_name', '-')} | "
+            f"Contratado em: {project.get('contracted_at', '-')}"
+        )
 
     @rx.var
     def selected_project_link_clients_summary(self) -> str:
@@ -1705,6 +2929,40 @@ class State(SessionStateMixin):
             for client_id in self.new_project_assigned_client_ids
         ]
         return ", ".join(names)
+
+    @rx.var(cache=False)
+    def workflow_hierarchy_snapshot(self) -> list[dict[str, str]]:
+        if not self.selected_project_id.isdigit():
+            return []
+        session = SessionLocal()
+        project = session.query(ProjectModel).filter(ProjectModel.id == int(self.selected_project_id)).first()
+        assigned_ids = {
+            str(row[0])
+            for row in session.query(ProjectAssignmentModel.client_id).filter(
+                ProjectAssignmentModel.project_id == int(self.selected_project_id),
+                ProjectAssignmentModel.client_id.is_not(None),
+            ).all()
+        }
+        if project and project.client_id is not None:
+            assigned_ids.add(str(project.client_id))
+        client_rows = [row for row in session.query(ClientModel).all() if str(row.id) in assigned_ids]
+        parent_names = sorted({self.client_lookup.get(str(row.parent_client_id), "-") for row in client_rows if row.parent_client_id is not None})
+        user_rows = [
+            row
+            for row in session.query(UserModel).filter(UserModel.client_id.is_not(None)).all()
+            if str(row.client_id) in assigned_ids
+        ]
+        departments = sorted({(row.department or "-").strip() for row in user_rows if (row.department or "").strip()})
+        professions = sorted({(row.profession or "-").strip() for row in user_rows if (row.profession or "").strip()})
+        report_lines = sum(1 for row in user_rows if row.reports_to_user_id is not None)
+        session.close()
+        return [
+            {"label": "Grupo", "value": ", ".join(parent_names) or "Sem grupo", "detail": "estrutura cliente pai cadastrada"},
+            {"label": "Empresa", "value": ", ".join(sorted(row.trade_name or row.name for row in client_rows)) or "Sem empresa", "detail": "clientes vinculados ao projeto"},
+            {"label": "Área", "value": ", ".join(departments) or "Sem área", "detail": "departamentos vindos dos usuários"},
+            {"label": "Usuários", "value": str(len(user_rows)), "detail": "colaboradores vinculados às empresas do projeto"},
+            {"label": "Cargos e Reportes", "value": f"{len(professions)} cargos / {report_lines} reportes", "detail": "profissões e linhas de reporte cadastradas"},
+        ]
 
     @rx.var(cache=False)
     def workflow_boxes_data(self) -> list[dict[str, Any]]:
@@ -1810,6 +3068,10 @@ class State(SessionStateMixin):
             {
                 "id": r.id,
                 "title": r.title,
+                "client_name": self.client_lookup.get(str(r.client_id), "-") if r.client_id is not None else self.selected_project_record["client_name"],
+                "service_name": r.service_name or self.selected_project_record["service_name"],
+                "dimensions": r.dimension_names or "-",
+                "target_area": r.target_area or "-",
                 "owner": r.owner,
                 "due_date": r.due_date,
                 "status": r.status,
@@ -1833,6 +3095,344 @@ class State(SessionStateMixin):
     @rx.var(cache=False)
     def actions_done(self) -> list[dict[str, Any]]:
         return [a for a in self.action_plans_data if a["status"] == "concluido"]
+
+    @rx.var(cache=False)
+    def ai_documents_data(self) -> list[dict[str, str]]:
+        session = SessionLocal()
+        rows = self._visible_ai_documents_query(session).order_by(AssistantDocumentModel.uploaded_at.desc(), AssistantDocumentModel.id.desc()).all()
+        chunk_counts: dict[int, int] = {}
+        for document_id, _ in session.query(AssistantChunkModel.document_id, AssistantChunkModel.id).all():
+            chunk_counts[int(document_id)] = chunk_counts.get(int(document_id), 0) + 1
+        data = [
+            {
+                "id": str(row.id),
+                "file_name": row.file_name,
+                "resource_type": row.resource_type or "politica",
+                "project_scope": "Base SmartLab" if row.knowledge_scope == "smartlab" else ("Projeto atual" if row.project_id else "Tenant"),
+                "knowledge_scope": row.knowledge_scope or "tenant",
+                "uploaded_by": row.uploaded_by or "-",
+                "uploaded_at": row.uploaded_at.strftime("%Y-%m-%d %H:%M") if row.uploaded_at else "-",
+                "file_size": f"{max(int(row.file_size or 0) // 1024, 1)} KB" if int(row.file_size or 0) > 0 else "-",
+                "chunk_count": str(chunk_counts.get(int(row.id), 0)),
+                "can_delete": bool(row.knowledge_scope != "smartlab" or self.user_scope == "smartlab"),
+            }
+            for row in rows
+        ]
+        session.close()
+        return data
+
+    @rx.var(cache=False)
+    def ai_context_summary(self) -> dict[str, str]:
+        session = SessionLocal()
+        target_tenant = self.selected_project_source_tenant if self.ai_scope_mode_effective == "projeto" else self.current_tenant
+        forms_count = session.query(FormModel).filter(FormModel.tenant_id == target_tenant).count()
+        tenant_documents_count = session.query(AssistantDocumentModel).filter(
+            AssistantDocumentModel.tenant_id == target_tenant,
+            AssistantDocumentModel.knowledge_scope == "tenant",
+        ).count()
+        smartlab_documents_count = session.query(AssistantDocumentModel).filter(
+            AssistantDocumentModel.knowledge_scope == "smartlab"
+        ).count()
+        tenant_chunk_document_ids = [
+            int(row[0])
+            for row in session.query(AssistantDocumentModel.id).filter(
+                AssistantDocumentModel.tenant_id == target_tenant,
+                AssistantDocumentModel.knowledge_scope == "tenant",
+            ).all()
+        ]
+        smartlab_chunk_document_ids = [
+            int(row[0])
+            for row in session.query(AssistantDocumentModel.id).filter(
+                AssistantDocumentModel.knowledge_scope == "smartlab"
+            ).all()
+        ]
+        chunk_document_ids = list({*tenant_chunk_document_ids, *smartlab_chunk_document_ids})
+        chunk_count = 0
+        if chunk_document_ids:
+            chunk_count = session.query(AssistantChunkModel).filter(AssistantChunkModel.document_id.in_(chunk_document_ids)).count()
+        query_interviews = session.query(InterviewSessionModel).filter(InterviewSessionModel.tenant_id == target_tenant)
+        query_actions = session.query(ActionPlanModel).filter(ActionPlanModel.tenant_id == target_tenant)
+        if self.ai_scope_mode_effective == "projeto" and self.selected_project_id and self.selected_project_id.isdigit():
+            project_id = int(self.selected_project_id)
+            query_interviews = query_interviews.filter(InterviewSessionModel.project_id == project_id)
+            query_actions = query_actions.filter(ActionPlanModel.project_id == project_id)
+        interviews = query_interviews.all()
+        interview_ids = [row.id for row in interviews]
+        responses_count = 0
+        if interview_ids:
+            responses_count = session.query(ResponseModel).filter(
+                ResponseModel.tenant_id == target_tenant,
+                ResponseModel.interview_id.in_(interview_ids),
+            ).count()
+        actions_total = query_actions.count()
+        actions_open = query_actions.filter(ActionPlanModel.status != "concluido").count()
+        session.close()
+        return {
+            "tenant": target_tenant,
+            "scope": self.ai_scope_mode_effective,
+            "documents": str(tenant_documents_count + smartlab_documents_count),
+            "tenant_documents": str(tenant_documents_count),
+            "smartlab_documents": str(smartlab_documents_count),
+            "chunks": str(chunk_count),
+            "forms": str(forms_count),
+            "interviews": str(len(interviews)),
+            "responses": str(responses_count),
+            "actions_total": str(actions_total),
+            "actions_open": str(actions_open),
+        }
+
+    @rx.var(cache=False)
+    def ai_response_insights(self) -> dict[str, Any]:
+        session = SessionLocal()
+        target_tenant = self.selected_project_source_tenant if self.ai_scope_mode_effective == "projeto" else self.current_tenant
+        query_interviews = session.query(InterviewSessionModel).filter(InterviewSessionModel.tenant_id == target_tenant)
+        query_responses = session.query(ResponseModel).filter(ResponseModel.tenant_id == target_tenant)
+        if self.ai_scope_mode_effective == "projeto" and self.selected_project_id and self.selected_project_id.isdigit():
+            project_id = int(self.selected_project_id)
+            query_interviews = query_interviews.filter(InterviewSessionModel.project_id == project_id)
+            interview_ids = [row.id for row in query_interviews.all()]
+            if interview_ids:
+                query_responses = query_responses.filter(ResponseModel.interview_id.in_(interview_ids))
+            else:
+                query_responses = query_responses.filter(ResponseModel.id == -1)
+        interviews = query_interviews.all()
+        responses = query_responses.all()
+        user_rows = session.query(UserModel).all()
+        client_rows = session.query(ClientModel).all()
+        user_lookup = {int(row.id): row.name for row in user_rows}
+        user_client_lookup = {int(row.id): str(row.client_id) if row.client_id is not None else "" for row in user_rows}
+        client_lookup = {str(row.id): row.trade_name or row.name for row in client_rows}
+        respondent_counts: dict[str, int] = {}
+        company_counts: dict[str, int] = {}
+        company_respondent_map: dict[str, set[str]] = {}
+        interview_status_counts: dict[str, int] = {}
+        interview_company_counts: dict[str, int] = {}
+        interview_company_status_map: dict[str, set[str]] = {}
+        completed_interviewees: list[str] = []
+        completed_companies: set[str] = set()
+        for interview in interviews:
+            status = (interview.status or "sem_status").strip().lower()
+            interview_status_counts[status] = interview_status_counts.get(status, 0) + 1
+            company_name = client_lookup.get(str(interview.client_id), "Empresa não identificada") if interview.client_id is not None else "Empresa não identificada"
+            interview_company_counts[company_name] = interview_company_counts.get(company_name, 0) + 1
+            interview_company_status_map.setdefault(company_name, set()).add(status)
+            if status == "concluida":
+                completed_interviewees.append(interview.interviewee_name or "Entrevistado não identificado")
+                completed_companies.add(company_name)
+        for row in responses:
+            client_name = "Empresa não identificada"
+            client_id = str(row.client_id) if row.client_id is not None else ""
+            if not client_id and row.respondent_id and int(row.respondent_id) in user_client_lookup:
+                client_id = user_client_lookup[int(row.respondent_id)]
+            if not client_id and row.interview_id:
+                interview = next((item for item in interviews if item.id == row.interview_id), None)
+                if interview and interview.client_id is not None:
+                    client_id = str(interview.client_id)
+            if client_id and client_id in client_lookup:
+                client_name = client_lookup[client_id]
+            if row.respondent_id and int(row.respondent_id) in user_lookup:
+                name = user_lookup[int(row.respondent_id)]
+            elif row.interview_id:
+                interview = next((item for item in interviews if item.id == row.interview_id), None)
+                name = interview.interviewee_name if interview and interview.interviewee_name else f"Entrevista {row.interview_id}"
+            else:
+                name = "Respondente não identificado"
+            respondent_counts[name] = respondent_counts.get(name, 0) + 1
+            company_counts[client_name] = company_counts.get(client_name, 0) + 1
+            company_respondent_map.setdefault(client_name, set()).add(name)
+        interview_names = [row.interviewee_name for row in interviews if row.interviewee_name]
+        session.close()
+        top_respondents = [
+            {"name": name, "responses": count}
+            for name, count in sorted(respondent_counts.items(), key=lambda item: (-item[1], item[0]))
+        ]
+        top_companies = [
+            {
+                "name": name,
+                "responses": count,
+                "respondents": ", ".join(sorted(company_respondent_map.get(name, set()))),
+            }
+            for name, count in sorted(company_counts.items(), key=lambda item: (-item[1], item[0]))
+        ]
+        interview_companies = [
+            {
+                "name": name,
+                "status_count": count,
+                "statuses": ", ".join(sorted(interview_company_status_map.get(name, set()))),
+            }
+            for name, count in sorted(interview_company_counts.items(), key=lambda item: (-item[1], item[0]))
+        ]
+        return {
+            "total_responses": len(responses),
+            "total_interviews": len(interviews),
+            "interviews_completed": interview_status_counts.get("concluida", 0),
+            "interviews_in_progress": interview_status_counts.get("em_andamento", 0),
+            "respondent_names": [item["name"] for item in top_respondents],
+            "respondent_breakdown": top_respondents,
+            "company_names": [item["name"] for item in top_companies],
+            "company_breakdown": top_companies,
+            "interview_company_names": [item["name"] for item in interview_companies],
+            "interview_company_breakdown": interview_companies,
+            "completed_interviewees": sorted(completed_interviewees),
+            "completed_companies": sorted(completed_companies),
+            "interviewee_names": interview_names,
+        }
+
+    @rx.var
+    def ai_source_snapshot(self) -> list[dict[str, str]]:
+        return [
+            {"label": "Documentos IA", "value": self.ai_context_summary["documents"], "detail": "PDF, Word, Excel e outros artefatos indexados"},
+            {"label": "Base SmartLab", "value": self.ai_context_summary["smartlab_documents"], "detail": "materiais-mestre compartilhados pela SmartLab"},
+            {"label": "Chunks RAG", "value": self.ai_context_summary["chunks"], "detail": "trechos prontos para recuperação contextual"},
+            {"label": "Formulários", "value": self.ai_context_summary["forms"], "detail": "instrumentos ativos no tenant"},
+            {"label": "Entrevistas", "value": self.ai_context_summary["interviews"], "detail": "sessões vinculadas ao contexto"},
+            {"label": "Respostas", "value": self.ai_context_summary["responses"], "detail": "evidências textuais e scores"},
+            {"label": "Planos em aberto", "value": self.ai_context_summary["actions_open"], "detail": "ações ainda não concluídas"},
+        ]
+
+    @rx.var
+    def ai_recommended_actions(self) -> list[dict[str, str]]:
+        recommendations: list[dict[str, str]] = []
+        critical_rows = [row for row in self.dashboard_table if row["status"] in {"Crítico", "Moderado"}]
+        for row in critical_rows[:3]:
+            recommendations.append(
+                {
+                    "title": f"Plano 30-60-90 para {row['form']}",
+                    "owner": "Liderança do processo",
+                    "due_date": "30 dias",
+                    "expected_result": (
+                        f"Elevar a categoria {row['categoria']} acima de {row['media']} com base em políticas, entrevistas e evidências do tenant."
+                    ),
+                }
+            )
+        if not recommendations:
+            recommendations.append(
+                {
+                    "title": "Revisar aderência entre políticas e respostas",
+                    "owner": "Consultoria SmartLab",
+                    "due_date": "15 dias",
+                    "expected_result": "Consolidar lacunas, conflitos e ausências documentais antes da próxima rodada de entrevistas.",
+                }
+            )
+        return recommendations
+
+    @rx.var
+    def ai_history_data(self) -> list[dict[str, str]]:
+        return list(reversed(self.ai_history))
+
+    @rx.var(cache=False)
+    def audit_events_data(self) -> list[dict[str, str]]:
+        if not AUDIT_LOG_PATH.exists():
+            return []
+        entries: list[dict[str, str]] = []
+        for idx, line in enumerate(AUDIT_LOG_PATH.read_text(encoding="utf-8").splitlines(), start=1):
+            if not line.strip():
+                continue
+            try:
+                parsed = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            entry = {str(key): str(value) for key, value in parsed.items()}
+            entry.setdefault("question", "")
+            entry.setdefault("answer", "")
+            entry.setdefault("model", "")
+            entry.setdefault("assistant_scope", "")
+            entry.setdefault("answer_mode", "")
+            entry.setdefault("sources", "")
+            entry.setdefault("audit_id", str(idx))
+            if entry.get("event", "").startswith("assistant.ask"):
+                raw_event = entry.get("event", "")
+                if not entry["answer_mode"]:
+                    if raw_event == "assistant.ask.factual":
+                        entry["answer_mode"] = "factual"
+                    elif raw_event == "assistant.ask.fallback":
+                        entry["answer_mode"] = "fallback"
+                    else:
+                        entry["answer_mode"] = "llm"
+                entry["event"] = "assistant.ask"
+                entry["event_label"] = "Especialista IA"
+                entry["answer_mode_label"] = {
+                    "factual": "Banco local",
+                    "llm": "LLM local",
+                    "fallback": "Fallback",
+                }.get(entry["answer_mode"], entry["answer_mode"] or "-")
+            else:
+                entry.setdefault("event_label", entry.get("event", ""))
+                entry.setdefault("answer_mode_label", "")
+            if self.user_scope != "smartlab" and entry.get("tenant") != self.current_tenant:
+                continue
+            entries.append(entry)
+        return list(reversed(entries[-200:]))
+
+    @rx.var
+    def audit_scope_options(self) -> list[str]:
+        values = sorted({item["scope"] for item in self.audit_events_data if item.get("scope")})
+        return ["Todos", *values]
+
+    @rx.var
+    def audit_event_options(self) -> list[str]:
+        values = sorted({item["event"] for item in self.audit_events_data if item.get("event")})
+        return ["Todos", *values]
+
+    @rx.var
+    def audit_tenant_options(self) -> list[str]:
+        values = sorted({item["tenant"] for item in self.audit_events_data if item.get("tenant")})
+        return ["Todos", *values]
+
+    @rx.var
+    def audit_user_options(self) -> list[str]:
+        values = sorted({item["user"] for item in self.audit_events_data if item.get("user")})
+        return ["Todos", *values]
+
+    @rx.var
+    def audit_filtered_events_data(self) -> list[dict[str, str]]:
+        data = list(self.audit_events_data)
+        if self.audit_filter_scope != "Todos":
+            data = [item for item in data if item["scope"] == self.audit_filter_scope]
+        if self.audit_filter_event != "Todos":
+            data = [item for item in data if item["event"] == self.audit_filter_event]
+        if self.audit_filter_tenant != "Todos":
+            data = [item for item in data if item["tenant"] == self.audit_filter_tenant]
+        if self.audit_filter_user != "Todos":
+            data = [item for item in data if item["user"] == self.audit_filter_user]
+        return data
+
+    @rx.var
+    def audit_theme_summary(self) -> list[dict[str, str]]:
+        counts: dict[str, int] = {}
+        for item in self.audit_filtered_events_data:
+            scope = item.get("scope", "info") or "info"
+            counts[scope] = counts.get(scope, 0) + 1
+        return [
+            {
+                "scope": scope,
+                "count": str(count),
+                "label": scope.replace("_", " ").title(),
+            }
+            for scope, count in sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))
+        ]
+
+    @rx.var
+    def audit_grouped_sections(self) -> list[dict[str, Any]]:
+        grouped: dict[str, list[dict[str, str]]] = {}
+        for item in self.audit_filtered_events_data:
+            scope = item.get("scope", "info") or "info"
+            grouped.setdefault(scope, []).append(item)
+        return [
+            {
+                "scope": scope,
+                "title": scope.replace("_", " ").title(),
+                "count": str(len(items)),
+                "items": items,
+            }
+            for scope, items in sorted(grouped.items(), key=lambda pair: pair[0])
+        ]
+
+    @rx.var
+    def audit_log_path_display(self) -> str:
+        return str(AUDIT_LOG_PATH)
 
     @rx.var(cache=False)
     def permission_boxes_data(self) -> list[dict[str, Any]]:
@@ -2107,6 +3707,7 @@ class State(SessionStateMixin):
         self.hydrate_tenant_context()
         if not self.show_menu_projects and self.active_view == "projetos":
             self.active_view = "dashboard"
+        self._append_audit_entry("tenant.switch", f"Contexto alterado para tenant {value}", "security")
 
     def switch_tenant_from_display(self, value: str):
         session = SessionLocal()
@@ -2161,6 +3762,28 @@ class State(SessionStateMixin):
     def set_new_client_custom_business_sector(self, value: str):
         self.new_client_custom_business_sector = value
 
+    def confirm_new_client_business_sector(self):
+        value = self._register_catalog_option("business_sector", self.new_client_custom_business_sector)
+        if not value:
+            self.toast_message = "Informe o ramo de atividade antes de confirmar"
+            self.toast_type = "error"
+            return
+        self.new_client_business_sector = value
+        self.new_client_custom_business_sector = ""
+        if self.editing_client_id.isdigit():
+            session = SessionLocal()
+            client = (
+                session.query(ClientModel)
+                .filter(ClientModel.id == int(self.editing_client_id), ClientModel.tenant_id == self.current_tenant)
+                .first()
+            )
+            if client:
+                client.business_sector = value
+                session.commit()
+            session.close()
+        self.toast_message = "Ramo registrado e disponível na lista"
+        self.toast_type = "success"
+
     def set_new_client_employee_count(self, value: str):
         self.new_client_employee_count = value
 
@@ -2202,6 +3825,24 @@ class State(SessionStateMixin):
     def set_new_user_custom_profession(self, value: str):
         self.new_user_custom_profession = value
 
+    def confirm_new_user_profession(self):
+        value = self._register_catalog_option("user_profession", self.new_user_custom_profession)
+        if not value:
+            self.toast_message = "Informe a profissao antes de confirmar"
+            self.toast_type = "error"
+            return
+        self.new_user_profession = value
+        self.new_user_custom_profession = ""
+        if self.editing_user_id.isdigit():
+            session = SessionLocal()
+            user = session.query(UserModel).filter(UserModel.id == int(self.editing_user_id)).first()
+            if user:
+                user.profession = value
+                session.commit()
+            session.close()
+        self.toast_message = "Profissao registrada e disponível na lista"
+        self.toast_type = "success"
+
     def set_new_user_department(self, value: str):
         self.new_user_department = value
         if value != "Outro":
@@ -2226,6 +3867,24 @@ class State(SessionStateMixin):
 
     def set_new_user_custom_department(self, value: str):
         self.new_user_custom_department = value
+
+    def confirm_new_user_department(self):
+        value = self._register_catalog_option("user_department", self.new_user_custom_department)
+        if not value:
+            self.toast_message = "Informe o departamento antes de confirmar"
+            self.toast_type = "error"
+            return
+        self.new_user_department = value
+        self.new_user_custom_department = ""
+        if self.editing_user_id.isdigit():
+            session = SessionLocal()
+            user = session.query(UserModel).filter(UserModel.id == int(self.editing_user_id)).first()
+            if user:
+                user.department = value
+                session.commit()
+            session.close()
+        self.toast_message = "Departamento registrado e disponível na lista"
+        self.toast_type = "success"
 
     def toggle_new_user_assigned_clients_open(self):
         self.new_user_assigned_clients_open = not self.new_user_assigned_clients_open
@@ -2269,6 +3928,8 @@ class State(SessionStateMixin):
         self.new_tenant_slug = ""
         self.new_tenant_limit = "50"
         self.new_tenant_client_id = ""
+        self.new_tenant_assigned_client_ids = []
+        self.new_tenant_assigned_clients_open = False
 
     def reset_role_form(self):
         self.editing_role_id = ""
@@ -2284,6 +3945,9 @@ class State(SessionStateMixin):
         self.editing_form_id = ""
         self.new_form_name = ""
         self.new_form_category = "Diagnóstico Cultura de Segurança"
+        self.new_form_custom_category = ""
+        self.new_form_stage = "Visita Técnica - Guiada"
+        self.new_form_custom_stage = ""
         self.new_form_target_client_id = ""
         self.new_form_target_user_email = ""
         self.new_question_dimension = "Presença"
@@ -2296,10 +3960,15 @@ class State(SessionStateMixin):
     def reset_interview_form(self):
         self.editing_interview_id = ""
         self.new_interview_form_id = ""
+        self.new_interview_project_id = ""
         self.new_interview_client_id = ""
         self.new_interview_user_id = ""
+        self.new_interview_area = ""
+        self.new_interview_group_name = ""
         self.new_interview_date = ""
         self.new_interview_notes = ""
+        self.interview_draft_active = False
+        self.interview_score_touched_ids = []
 
     def start_edit_client(self, client_id: int):
         session = SessionLocal()
@@ -2380,6 +4049,11 @@ class State(SessionStateMixin):
         self.new_tenant_slug = row.slug or ""
         self.new_tenant_limit = str(row.limit_users or 50)
         self.new_tenant_client_id = str(row.owner_client_id or "")
+        assigned_client_ids = [str(item) for item in _loads_json(row.assigned_client_ids, []) if str(item).isdigit()]
+        if not assigned_client_ids and row.owner_client_id is not None:
+            assigned_client_ids = self._expand_client_scope([str(row.owner_client_id)])
+        self.new_tenant_assigned_client_ids = assigned_client_ids
+        self.new_tenant_assigned_clients_open = False
 
     def start_edit_role(self, role_id: int):
         session = SessionLocal()
@@ -2421,6 +4095,8 @@ class State(SessionStateMixin):
         self.selected_form_id = str(row.id)
         self.new_form_name = row.name or ""
         self.new_form_category = row.service_name or "Diagnóstico Cultura de Segurança"
+        self.new_form_stage = row.stage_name or "Visita Técnica - Guiada"
+        self.new_form_custom_stage = ""
         self.new_form_target_client_id = ""
         self.new_form_target_user_email = ""
 
@@ -2475,6 +4151,17 @@ class State(SessionStateMixin):
             self.toast_type = "success"
         session.close()
 
+    def cancel_edit_question(self):
+        self.editing_question_id = ""
+        self.new_question_text = ""
+        self.new_question_dimension = "Presença"
+        self.new_question_custom_dimension = ""
+        self.new_question_type = "escala_0_5"
+        self.new_question_polarity = "positiva"
+        self.new_question_weight = "1"
+        self.new_question_options = "Nada Aderente,Pouco Aderente,Parcialmente Aderente,Moderadamente Aderente,Muito Aderente,Totalmente Aderente"
+        self.new_question_condition = ""
+
     def set_new_tenant_name(self, value: str):
         self.new_tenant_name = value
 
@@ -2499,8 +4186,79 @@ class State(SessionStateMixin):
     def set_new_form_name(self, value: str):
         self.new_form_name = value
 
+    def set_new_form_stage(self, value: str):
+        self.new_form_stage = value
+        if value != "Outra":
+            self.new_form_custom_stage = ""
+        if not self.selected_form_id.isdigit():
+            return
+        if value == "Outra":
+            return
+        session = SessionLocal()
+        survey = (
+            session.query(SurveyModel)
+            .filter(SurveyModel.id == int(self.selected_form_id), SurveyModel.tenant_id == self.current_tenant)
+            .first()
+        )
+        if survey:
+            survey.stage_name = value
+            session.commit()
+        session.close()
+
+    def set_new_form_custom_stage(self, value: str):
+        self.new_form_custom_stage = value
+
+    def confirm_new_form_stage(self):
+        value = self._register_catalog_option("survey_stage", self.new_form_custom_stage)
+        if not value:
+            self.toast_message = "Informe a etapa antes de confirmar"
+            self.toast_type = "error"
+            return
+        self.new_form_stage = value
+        self.new_form_custom_stage = ""
+        if self.selected_form_id.isdigit():
+            session = SessionLocal()
+            survey = (
+                session.query(SurveyModel)
+                .filter(SurveyModel.id == int(self.selected_form_id), SurveyModel.tenant_id == self.current_tenant)
+                .first()
+            )
+            if survey:
+                survey.stage_name = value
+                session.commit()
+            session.close()
+        self.toast_message = "Etapa registrada e disponível na lista"
+        self.toast_type = "success"
+
     def set_new_form_category(self, value: str):
         self.new_form_category = value
+        if value != "Outro":
+            self.new_form_custom_category = ""
+
+    def set_new_form_custom_category(self, value: str):
+        self.new_form_custom_category = value
+
+    def confirm_new_form_category(self):
+        value = self._register_catalog_option("smartlab_service", self.new_form_custom_category)
+        if not value:
+            self.toast_message = "Informe o serviço antes de confirmar"
+            self.toast_type = "error"
+            return
+        self.new_form_category = value
+        self.new_form_custom_category = ""
+        if self.editing_form_id.isdigit():
+            session = SessionLocal()
+            survey = (
+                session.query(SurveyModel)
+                .filter(SurveyModel.id == int(self.editing_form_id), SurveyModel.tenant_id == self.current_tenant)
+                .first()
+            )
+            if survey:
+                survey.service_name = value
+                session.commit()
+            session.close()
+        self.toast_message = "Serviço registrado e disponível na lista"
+        self.toast_type = "success"
 
     def set_new_form_target_client_option(self, value: str):
         self.new_form_target_client_id = value.split(" - ", 1)[0].strip() if value else ""
@@ -2510,16 +4268,71 @@ class State(SessionStateMixin):
 
     def set_new_interview_form_option(self, value: str):
         self.new_interview_form_id = value.split(" - ", 1)[0].strip() if value else ""
-
-    def set_new_interview_client_option(self, value: str):
-        self.new_interview_client_id = value.split(" - ", 1)[0].strip() if value else ""
         self.new_interview_user_id = ""
+        self.new_interview_area = ""
+        self.new_interview_group_name = ""
+
+    def set_new_interview_project_option(self, value: str):
+        self.new_interview_project_id = value.split(" - ", 1)[0].strip() if value else ""
+        self.new_interview_form_id = ""
+        self.new_interview_user_id = ""
+        self.new_interview_area = ""
+        self.new_interview_group_name = ""
+        self.new_interview_notes = self.new_interview_notes
+        if not self.new_interview_project_id.isdigit():
+            self.new_interview_client_id = ""
+            return
+        session = SessionLocal()
+        project = (
+            session.query(ProjectModel.client_id)
+            .filter(
+                ProjectModel.id == int(self.new_interview_project_id),
+                ProjectModel.tenant_id == self.current_tenant,
+            )
+            .first()
+        )
+        session.close()
+        self.new_interview_client_id = str(project[0]) if project and project[0] is not None else ""
+        self.interview_draft_active = False
 
     def set_new_interview_date(self, value: str):
         self.new_interview_date = value
 
     def set_new_interview_user_option(self, value: str):
         self.new_interview_user_id = value.split(" - ", 1)[0].strip() if value else ""
+
+    def set_new_interview_area(self, value: str):
+        self.new_interview_area = value
+
+    def set_new_interview_group_name(self, value: str):
+        self.new_interview_group_name = value
+
+    def set_edit_interview_form_option(self, value: str):
+        self.edit_interview_form_id = value.split(" - ", 1)[0].strip() if value else ""
+
+    def set_edit_interview_project_option(self, value: str):
+        self.edit_interview_project_id = value.split(" - ", 1)[0].strip() if value else ""
+        self.edit_interview_form_id = ""
+        if not self.edit_interview_project_id.isdigit():
+            self.edit_interview_client_id = ""
+            return
+        session = SessionLocal()
+        row = (
+            session.query(ProjectModel.client_id)
+            .filter(
+                ProjectModel.id == int(self.edit_interview_project_id),
+                ProjectModel.tenant_id == self.current_tenant,
+            )
+            .first()
+        )
+        session.close()
+        self.edit_interview_client_id = str(row[0]) if row and row[0] is not None else ""
+
+    def set_edit_interview_date(self, value: str):
+        self.edit_interview_date = value
+
+    def set_edit_interview_status(self, value: str):
+        self.edit_interview_status = value or "em_andamento"
 
     def set_new_interview_notes(self, value: str):
         self.new_interview_notes = value
@@ -2537,6 +4350,31 @@ class State(SessionStateMixin):
 
     def set_new_question_custom_dimension(self, value: str):
         self.new_question_custom_dimension = value
+
+    def confirm_new_question_dimension(self):
+        value = self._register_catalog_option("question_dimension", self.new_question_custom_dimension)
+        if not value:
+            self.toast_message = "Informe a dimensão antes de confirmar"
+            self.toast_type = "error"
+            return
+        self.new_question_dimension = value
+        self.new_question_custom_dimension = ""
+        if self.editing_question_id.isdigit():
+            session = SessionLocal()
+            question = (
+                session.query(QuestionModel)
+                .filter(
+                    QuestionModel.id == int(self.editing_question_id),
+                    QuestionModel.tenant_id == self.current_tenant,
+                )
+                .first()
+            )
+            if question:
+                question.dimension = value
+                session.commit()
+            session.close()
+        self.toast_message = "Dimensão registrada e disponível na lista"
+        self.toast_type = "success"
 
     def set_new_question_weight(self, value: str):
         self.new_question_weight = value
@@ -2559,9 +4397,43 @@ class State(SessionStateMixin):
         updated = dict(self.interview_score_map)
         updated[str(question_id)] = str(value).strip() if str(value).strip() else "0"
         self.interview_score_map = updated
+        if str(question_id) not in self.interview_score_touched_ids:
+            self.interview_score_touched_ids = [*self.interview_score_touched_ids, str(question_id)]
 
     def set_ai_prompt(self, value: str):
         self.ai_prompt = value
+
+    def set_ai_selected_model(self, value: str):
+        self.ai_selected_model = value
+
+    def set_ai_resource_type(self, value: str):
+        self.ai_resource_type = value
+
+    def set_ai_knowledge_scope(self, value: str):
+        self.ai_knowledge_scope = value
+
+    def set_ai_scope_mode(self, value: str):
+        self.ai_scope_mode = value
+
+    def set_audit_filter_scope(self, value: str):
+        self.audit_filter_scope = value
+
+    def set_audit_filter_event(self, value: str):
+        self.audit_filter_event = value
+
+    def set_audit_filter_tenant(self, value: str):
+        self.audit_filter_tenant = value
+
+    def set_audit_filter_user(self, value: str):
+        self.audit_filter_user = value
+
+    def toggle_audit_event_expanded(self, audit_id: str):
+        current = list(self.audit_expanded_event_ids)
+        if audit_id in current:
+            current = [item for item in current if item != audit_id]
+        else:
+            current.append(audit_id)
+        self.audit_expanded_event_ids = current
 
     def set_new_project_name(self, value: str):
         self.new_project_name = value
@@ -2569,9 +4441,198 @@ class State(SessionStateMixin):
     def set_new_project_type(self, value: str):
         self.new_project_type = value
 
+    def set_new_project_service_name(self, value: str):
+        self.new_project_service_name = value
+        if value != "Outro":
+            self.new_project_custom_service_name = ""
+
+    def set_new_project_custom_service_name(self, value: str):
+        self.new_project_custom_service_name = value
+
+    def confirm_new_project_service_name(self):
+        value = self._register_catalog_option("smartlab_service", self.new_project_custom_service_name)
+        if not value:
+            self.toast_message = "Informe o serviço antes de confirmar"
+            self.toast_type = "error"
+            return
+        self.new_project_service_name = value
+        self.new_project_custom_service_name = ""
+        self.toast_message = "Serviço registrado e disponível na lista"
+        self.toast_type = "success"
+
+    def set_new_project_client_option(self, value: str):
+        self.new_project_client_id = value.split(" - ", 1)[0].strip() if value else ""
+
+    def set_new_project_contracted_at(self, value: str):
+        self.new_project_contracted_at = value
+
+    def set_project_portfolio_service_filter(self, value: str):
+        self.project_portfolio_service_filter = value or "Todos"
+
+    def start_edit_project(self, project_id: int):
+        session = SessionLocal()
+        project = (
+            session.query(ProjectModel)
+            .filter(
+                ProjectModel.id == int(project_id),
+                ProjectModel.tenant_id == self.current_tenant,
+            )
+            .first()
+        )
+        session.close()
+        if not project:
+            self.toast_message = "Projeto não encontrado"
+            self.toast_type = "error"
+            return
+        self.editing_project_id = str(project.id)
+        self.new_project_name = project.name or ""
+        self.new_project_type = project.project_type or "Diagnóstico de Cultura"
+        self.new_project_service_name = project.service_name or "Diagnóstico Cultura de Segurança"
+        self.new_project_custom_service_name = ""
+        self.new_project_client_id = str(project.client_id or "")
+        self.new_project_contracted_at = project.contracted_at or ""
+
+    def cancel_edit_project(self):
+        self.editing_project_id = ""
+        self.new_project_name = ""
+        self.new_project_type = "Diagnóstico de Cultura"
+        self.new_project_service_name = "Diagnóstico Cultura de Segurança"
+        self.new_project_custom_service_name = ""
+        self.new_project_client_id = ""
+        self.new_project_contracted_at = ""
+
+    def save_project_inline(self):
+        if not self.editing_project_id.isdigit():
+            self.toast_message = "Nenhum projeto em edição"
+            self.toast_type = "error"
+            return
+        if not self.new_project_name.strip():
+            self.toast_message = "Informe o nome do projeto"
+            self.toast_type = "error"
+            return
+        if not self.new_project_client_id.isdigit():
+            self.toast_message = "Selecione o cliente do projeto"
+            self.toast_type = "error"
+            return
+        service_name = self.effective_new_project_service_name.strip()
+        if self.new_project_service_name == "Outro" and not self.new_project_custom_service_name.strip():
+            self.toast_message = "Informe o nome do novo serviço SmartLab"
+            self.toast_type = "error"
+            return
+        session = SessionLocal()
+        project = (
+            session.query(ProjectModel)
+            .filter(
+                ProjectModel.id == int(self.editing_project_id),
+                ProjectModel.tenant_id == self.current_tenant,
+            )
+            .first()
+        )
+        if not project:
+            session.close()
+            self.toast_message = "Projeto não encontrado"
+            self.toast_type = "error"
+            return
+        project.name = self.new_project_name.strip()
+        project.project_type = self.new_project_type
+        project.service_name = service_name
+        project.client_id = int(self.new_project_client_id)
+        project.contracted_at = self.new_project_contracted_at.strip() or datetime.utcnow().strftime("%Y-%m-%d")
+        assignment = (
+            session.query(ProjectAssignmentModel)
+            .filter(ProjectAssignmentModel.project_id == int(project.id))
+            .first()
+        )
+        if assignment:
+            assignment.client_id = int(self.new_project_client_id)
+            assignment.tenant_id = self.current_tenant
+        else:
+            session.add(
+                ProjectAssignmentModel(
+                    project_id=int(project.id),
+                    tenant_id=self.current_tenant,
+                    client_id=int(self.new_project_client_id),
+                )
+            )
+        session.commit()
+        session.close()
+        self.selected_project_id = self.editing_project_id
+        self.cancel_edit_project()
+        self.toast_message = "Projeto atualizado"
+        self.toast_type = "success"
+        self.sync_project_assignments()
+
+    def delete_project(self, project_id: int):
+        if not self.can_configure_projects:
+            self.toast_message = "Projetos so podem ser geridos no SmartLab - interno"
+            self.toast_type = "error"
+            return
+        session = SessionLocal()
+        project = (
+            session.query(ProjectModel)
+            .filter(
+                ProjectModel.id == int(project_id),
+                ProjectModel.tenant_id == self.current_tenant,
+            )
+            .first()
+        )
+        if not project:
+            session.close()
+            self.toast_message = "Projeto não encontrado"
+            self.toast_type = "error"
+            return
+        interview_ids = [
+            int(row[0])
+            for row in session.query(InterviewSessionModel.id)
+            .filter(InterviewSessionModel.project_id == int(project_id))
+            .all()
+            if row[0] is not None
+        ]
+        action_count = session.query(ActionPlanModel.id).filter(ActionPlanModel.project_id == int(project_id)).count()
+        workflow_count = session.query(WorkflowBoxModel.id).filter(WorkflowBoxModel.project_id == int(project_id)).count()
+        document_ids = [
+            int(row[0])
+            for row in session.query(AssistantDocumentModel.id)
+            .filter(AssistantDocumentModel.project_id == int(project_id))
+            .all()
+            if row[0] is not None
+        ]
+        if interview_ids:
+            session.query(ResponseModel).filter(ResponseModel.interview_id.in_(interview_ids)).delete(synchronize_session=False)
+            session.query(InterviewSessionModel).filter(InterviewSessionModel.id.in_(interview_ids)).delete(synchronize_session=False)
+        if action_count:
+            session.query(ActionPlanModel).filter(ActionPlanModel.project_id == int(project_id)).delete(synchronize_session=False)
+        if workflow_count:
+            session.query(WorkflowBoxModel).filter(WorkflowBoxModel.project_id == int(project_id)).delete(synchronize_session=False)
+        if document_ids:
+            session.query(AssistantChunkModel).filter(AssistantChunkModel.document_id.in_(document_ids)).delete(synchronize_session=False)
+            session.query(AssistantDocumentModel).filter(AssistantDocumentModel.id.in_(document_ids)).delete(synchronize_session=False)
+        session.query(ProjectAssignmentModel).filter(ProjectAssignmentModel.project_id == int(project_id)).delete()
+        session.delete(project)
+        session.commit()
+        session.close()
+        if self.selected_project_id == str(project_id):
+            self.selected_project_id = ""
+        if self.editing_project_id == str(project_id):
+            self.cancel_edit_project()
+        details = []
+        if interview_ids:
+            details.append(f"{len(interview_ids)} entrevista(s)")
+        if action_count:
+            details.append(f"{action_count} plano(s)")
+        if workflow_count:
+            details.append(f"{workflow_count} caixa(s) de workflow")
+        if document_ids:
+            details.append(f"{len(document_ids)} documento(s) IA")
+        suffix = f" em cascata: {', '.join(details)}" if details else ""
+        self.toast_message = f"Projeto excluído{suffix}"
+        self.toast_type = "success"
+
     def select_project(self, value: str):
         self.selected_project_id = value.split(" - ", 1)[0].strip()
         self.sync_project_assignments()
+        if self.selected_project_id:
+            self._append_audit_entry("project.select", f"Projeto selecionado: {value}", "operations")
 
     def set_project_admin_tab(self, value: str):
         self.project_admin_tab = value
@@ -2653,11 +4714,33 @@ class State(SessionStateMixin):
     def set_new_action_expected_result(self, value: str):
         self.new_action_expected_result = value
 
+    def set_new_action_dimensions(self, value: str):
+        self.new_action_dimensions = value
+
+    def set_new_action_area(self, value: str):
+        self.new_action_area = value
+
     def set_new_user_client_id(self, value: str):
         self.new_user_client_id = value
 
     def set_new_user_tenant_id(self, value: str):
         self.new_user_tenant_id = value
+
+    def _expand_client_scope(self, client_ids: list[str]) -> list[str]:
+        normalized_ids = [int(client_id) for client_id in client_ids if client_id.isdigit()]
+        if not normalized_ids:
+            return []
+        session = SessionLocal()
+        rows = session.query(ClientModel.id, ClientModel.parent_client_id).all()
+        session.close()
+        children_map = _build_client_children_map(
+            [ClientModel(id=row[0], parent_client_id=row[1]) for row in rows]  # type: ignore[call-arg]
+        )
+        expanded: set[str] = set()
+        for client_id in normalized_ids:
+            expanded.add(str(client_id))
+            expanded.update(str(item) for item in _collect_descendant_client_ids(children_map, client_id))
+        return sorted(expanded, key=lambda item: int(item))
 
     def set_new_tenant_client_id(self, value: str):
         self.new_tenant_client_id = value
@@ -2665,6 +4748,20 @@ class State(SessionStateMixin):
     def set_new_tenant_client_option(self, value: str):
         client_id = value.split(" - ", 1)[0].strip()
         self.new_tenant_client_id = client_id
+        self.new_tenant_assigned_client_ids = [client_id] if client_id else []
+
+    def toggle_new_tenant_assigned_client(self, client_id: str):
+        current = list(self.new_tenant_assigned_client_ids)
+        if client_id in current:
+            current = [item for item in current if item != client_id]
+        else:
+            current.append(client_id)
+        current = sorted({item for item in current if item.isdigit()}, key=lambda item: int(item))
+        self.new_tenant_assigned_client_ids = current
+        self.new_tenant_client_id = current[0] if current else ""
+
+    def toggle_new_tenant_assigned_clients_open(self):
+        self.new_tenant_assigned_clients_open = not self.new_tenant_assigned_clients_open
 
     def set_perm_user_email(self, value: str):
         self.perm_user_email = value
@@ -2969,13 +5066,15 @@ class State(SessionStateMixin):
             self.toast_type = "error"
             return
         session = SessionLocal()
-        owner_client_id = int(self.new_tenant_client_id) if self.new_tenant_client_id.isdigit() else None
-        if owner_client_id is None:
+        tenant_slug = self.new_tenant_slug.strip().lower().replace(" ", "-")
+        is_default_workspace = tenant_slug == "default"
+        assigned_client_ids = self._expand_client_scope(self.new_tenant_assigned_client_ids)
+        owner_client_id = int(assigned_client_ids[0]) if assigned_client_ids else None
+        if not is_default_workspace and owner_client_id is None:
             self.toast_message = "Tenant de operacao deve ser vinculado a um cliente"
             self.toast_type = "error"
             session.close()
             return
-        tenant_slug = self.new_tenant_slug.strip().lower().replace(" ", "-")
         editing_id = self.editing_tenant_id.strip()
         if editing_id:
             row = session.query(TenantModel).filter(TenantModel.id == editing_id).first()
@@ -2997,6 +5096,7 @@ class State(SessionStateMixin):
             row.name = self.new_tenant_name.strip()
             row.slug = tenant_slug
             row.owner_client_id = owner_client_id
+            row.assigned_client_ids = json.dumps([] if is_default_workspace else assigned_client_ids)
             row.limit_users = int(self.new_tenant_limit or "50")
         else:
             tenant_id = tenant_slug
@@ -3012,12 +5112,18 @@ class State(SessionStateMixin):
                     name=self.new_tenant_name.strip(),
                     slug=tenant_slug,
                     owner_client_id=owner_client_id,
+                    assigned_client_ids=json.dumps([] if is_default_workspace else assigned_client_ids),
                     limit_users=int(self.new_tenant_limit or "50"),
                 )
             )
         session.commit()
         session.close()
         self.reset_tenant_form()
+        self._append_audit_entry(
+            "tenant.save",
+            f"Tenant {'atualizado' if editing_id else 'criado'}: {tenant_slug} com {len(assigned_client_ids) if not is_default_workspace else 'acesso total'} no escopo",
+            "security",
+        )
         self.toast_message = "Tenant atualizado" if editing_id else "Tenant criado"
         self.toast_type = "success"
 
@@ -3149,6 +5255,16 @@ class State(SessionStateMixin):
             self.toast_message = "Informe o nome da pesquisa"
             self.toast_type = "error"
             return
+        service_name = self.effective_new_form_service_name.strip()
+        stage_name = self.effective_new_form_stage_name.strip()
+        if self.new_form_category == "Outro" and not self.new_form_custom_category.strip():
+            self.toast_message = "Informe o nome do novo serviço SmartLab"
+            self.toast_type = "error"
+            return
+        if self.new_form_stage == "Outra" and not self.new_form_custom_stage.strip():
+            self.toast_message = "Informe o nome da nova etapa da pesquisa"
+            self.toast_type = "error"
+            return
         session = SessionLocal()
         if self.editing_form_id.isdigit():
             survey = (
@@ -3162,7 +5278,8 @@ class State(SessionStateMixin):
                 self.toast_type = "error"
                 return
             survey.name = self.new_form_name.strip()
-            survey.service_name = self.new_form_category
+            survey.service_name = service_name
+            survey.stage_name = stage_name
             if not survey.share_token:
                 survey.share_token = secrets.token_urlsafe(8)
             legacy_form = None
@@ -3184,7 +5301,7 @@ class State(SessionStateMixin):
         legacy_form = FormModel(
             tenant_id=self.current_tenant,
             name=self.new_form_name.strip(),
-            category=self.new_form_category,
+            category=service_name,
             target_client_id=None,
             target_user_email=None,
         )
@@ -3194,7 +5311,8 @@ class State(SessionStateMixin):
         survey = SurveyModel(
             tenant_id=self.current_tenant,
             name=self.new_form_name.strip(),
-            service_name=self.new_form_category,
+            service_name=service_name,
+            stage_name=stage_name,
             share_token=secrets.token_urlsafe(8),
             legacy_form_id=legacy_form.id,
         )
@@ -3232,25 +5350,51 @@ class State(SessionStateMixin):
 
     def select_form(self, value: str):
         self.selected_form_id = value.split(" - ", 1)[0].strip() if value else ""
+        if not self.selected_form_id.isdigit():
+            self.new_form_stage = "Visita Técnica - Guiada"
+            self.new_form_custom_stage = ""
+            return
+        available_stages = {stage for stage in self.survey_stage_options if stage != "Outra"}
+        for form in self.forms_data:
+            if str(form["id"]) == self.selected_form_id:
+                stage = form.get("stage", "Visita Técnica - Guiada")
+                if stage in available_stages:
+                    self.new_form_stage = stage
+                    self.new_form_custom_stage = ""
+                else:
+                    self.new_form_stage = "Outra"
+                    self.new_form_custom_stage = stage
+                break
 
     def select_form_by_id(self, form_id: int):
         self.selected_form_id = str(form_id)
+        available_stages = {stage for stage in self.survey_stage_options if stage != "Outra"}
+        for form in self.forms_data:
+            if str(form["id"]) == str(form_id):
+                stage = form.get("stage", "Visita Técnica - Guiada")
+                if stage in available_stages:
+                    self.new_form_stage = stage
+                    self.new_form_custom_stage = ""
+                else:
+                    self.new_form_stage = "Outra"
+                    self.new_form_custom_stage = stage
+                break
 
     def create_interview_session(self):
         if not self.can_operate_interviews:
             self.toast_message = "Somente consultores SmartLab podem registrar entrevistas"
             self.toast_type = "error"
             return
-        if not self.new_interview_form_id.isdigit():
-            self.toast_message = "Selecione a pesquisa base da aplicação"
+        if not self.new_interview_project_id.isdigit():
+            self.toast_message = "Selecione o projeto contratado pelo cliente"
             self.toast_type = "error"
             return
         if not self.new_interview_client_id.isdigit():
-            self.toast_message = "Selecione o cliente da entrevista"
+            self.toast_message = "O cliente precisa ser derivado do projeto selecionado"
             self.toast_type = "error"
             return
-        if not self.new_interview_user_id.isdigit():
-            self.toast_message = "Selecione o usuario que sera entrevistado"
+        if not self.new_interview_form_id.isdigit():
+            self.toast_message = "Selecione a pesquisa base da aplicação"
             self.toast_type = "error"
             return
         session = SessionLocal()
@@ -3262,81 +5406,228 @@ class State(SessionStateMixin):
             )
             .first()
         )
+        project = (
+            session.query(ProjectModel)
+            .filter(
+                ProjectModel.id == int(self.new_interview_project_id),
+                ProjectModel.tenant_id == self.current_tenant,
+            )
+            .first()
+        )
         if not survey:
             session.close()
             self.toast_message = "Pesquisa nao encontrada"
             self.toast_type = "error"
             return
-        interviewee = (
-            session.query(UserModel)
+        if not project:
+            session.close()
+            self.toast_message = "Projeto contratado nao encontrado"
+            self.toast_type = "error"
+            return
+        if project.client_id is not None and int(project.client_id) != int(self.new_interview_client_id):
+            session.close()
+            self.toast_message = "O projeto selecionado não pertence ao cliente informado"
+            self.toast_type = "error"
+            return
+        session.close()
+        self.selected_interview_id = ""
+        self.selected_form_id = self.new_interview_form_id
+        self.interview_answer_map = {}
+        self.interview_score_map = {}
+        self.interview_score_touched_ids = []
+        self.interview_draft_active = True
+        self.toast_message = "Entrevista preparada. Defina o contexto e depois clique em Salvar."
+        self.toast_type = "success"
+
+    def update_active_interview_context(self):
+        if not self.selected_interview_id.isdigit() and not self.interview_draft_active:
+            self.toast_message = "Selecione uma entrevista ativa"
+            self.toast_type = "error"
+            return
+        if not self.selected_interview_id.isdigit() and self.interview_draft_active:
+            stage_name = self.selected_interview_stage_name
+            if stage_name == "Entrevista Individual com o Líder":
+                if not self.new_interview_user_id.isdigit():
+                    self.toast_message = "Selecione o usuário respondente"
+                    self.toast_type = "error"
+                    return
+            elif stage_name == "Visita Técnica - Guiada":
+                if not self.new_interview_area.strip():
+                    self.toast_message = "Selecione a área observada"
+                    self.toast_type = "error"
+                    return
+            elif stage_name in {"Rodas de Conversa", "Rodada de Conversa"}:
+                if not self.new_interview_area.strip():
+                    self.toast_message = "Selecione a área da rodada"
+                    self.toast_type = "error"
+                    return
+                if not self.new_interview_group_name.strip():
+                    self.toast_message = "Informe o grupo entrevistado"
+                    self.toast_type = "error"
+                    return
+            self.toast_message = "Contexto da entrevista preparado"
+            self.toast_type = "success"
+            return
+        session = SessionLocal()
+        interview = (
+            session.query(InterviewSessionModel)
             .filter(
-                UserModel.id == int(self.new_interview_user_id),
-                UserModel.account_scope == "cliente",
+                InterviewSessionModel.id == int(self.selected_interview_id),
+                InterviewSessionModel.tenant_id == self.current_tenant,
             )
             .first()
         )
-        if not interviewee:
+        if not interview:
             session.close()
-            self.toast_message = "Usuario entrevistado nao encontrado"
+            self.toast_message = "Entrevista nao encontrada"
             self.toast_type = "error"
             return
-        if interviewee.client_id != int(self.new_interview_client_id):
-            session.close()
-            self.toast_message = "O usuario selecionado nao pertence ao cliente informado"
-            self.toast_type = "error"
-            return
-        consultant_name = self.login_email.strip().lower() or "consultor@smartlab.com"
-        interview = None
-        if self.editing_interview_id.isdigit():
-            interview = (
-                session.query(InterviewSessionModel)
+        survey = None
+        if interview.survey_id is not None:
+            survey = session.query(SurveyModel).filter(SurveyModel.id == int(interview.survey_id)).first()
+        stage_name = survey.stage_name if survey and survey.stage_name else self.selected_interview_record["stage_name"]
+        if stage_name == "Entrevista Individual com o Líder":
+            if not self.new_interview_user_id.isdigit():
+                session.close()
+                self.toast_message = "Selecione o usuário respondente"
+                self.toast_type = "error"
+                return
+            user = (
+                session.query(UserModel)
                 .filter(
-                    InterviewSessionModel.id == int(self.editing_interview_id),
-                    InterviewSessionModel.tenant_id == self.current_tenant,
+                    UserModel.id == int(self.new_interview_user_id),
+                    UserModel.account_scope == "cliente",
                 )
                 .first()
             )
-        if interview:
-            interview.form_id = int(survey.legacy_form_id or 0)
-            interview.survey_id = int(self.new_interview_form_id)
-            interview.project_id = None
-            interview.client_id = int(self.new_interview_client_id) if self.new_interview_client_id.isdigit() else None
-            interview.interviewee_user_id = int(self.new_interview_user_id)
-            interview.interview_date = self.new_interview_date.strip() or datetime.utcnow().strftime("%Y-%m-%d")
-            interview.interviewee_name = interviewee.name or interviewee.email
-            interview.interviewee_role = interviewee.profession or interviewee.department or None
-            interview.consultant_name = consultant_name
-            interview.notes = self.new_interview_notes.strip()
-            toast_message = "Entrevista atualizada"
+            if not user:
+                session.close()
+                self.toast_message = "Usuário não encontrado"
+                self.toast_type = "error"
+                return
+            if interview.client_id is not None and user.client_id != int(interview.client_id):
+                session.close()
+                self.toast_message = "O usuário selecionado não pertence ao cliente da entrevista"
+                self.toast_type = "error"
+                return
+            interview.interviewee_user_id = int(user.id)
+            interview.interviewee_name = user.name or user.email
+            interview.interviewee_role = user.profession or user.department or None
+            toast_message = "Respondente vinculado à entrevista"
+        elif stage_name == "Visita Técnica - Guiada":
+            if not self.new_interview_area.strip():
+                session.close()
+                self.toast_message = "Selecione a área observada"
+                self.toast_type = "error"
+                return
+            interview.interviewee_user_id = None
+            interview.target_area = self.new_interview_area.strip()
+            interview.audience_group = ""
+            interview.interviewee_name = f"Área: {self.new_interview_area.strip()}"
+            interview.interviewee_role = "Observação em campo"
+            toast_message = "Área da visita atualizada"
+        elif stage_name in {"Rodas de Conversa", "Rodada de Conversa"}:
+            if not self.new_interview_area.strip():
+                session.close()
+                self.toast_message = "Selecione a área da rodada"
+                self.toast_type = "error"
+                return
+            if not self.new_interview_group_name.strip():
+                session.close()
+                self.toast_message = "Informe o grupo entrevistado"
+                self.toast_type = "error"
+                return
+            interview.interviewee_user_id = None
+            interview.target_area = self.new_interview_area.strip()
+            interview.audience_group = self.new_interview_group_name.strip()
+            interview.interviewee_name = self.new_interview_group_name.strip()
+            interview.interviewee_role = self.new_interview_area.strip()
+            toast_message = "Contexto da rodada atualizado"
         else:
-            interview = InterviewSessionModel(
-                tenant_id=self.current_tenant,
-                form_id=int(survey.legacy_form_id or 0),
-                survey_id=int(self.new_interview_form_id),
-                project_id=None,
-                client_id=int(self.new_interview_client_id) if self.new_interview_client_id.isdigit() else None,
-                interviewee_user_id=int(self.new_interview_user_id),
-                interview_date=self.new_interview_date.strip() or datetime.utcnow().strftime("%Y-%m-%d"),
-                interviewee_name=(interviewee.name or interviewee.email),
-                interviewee_role=(interviewee.profession or interviewee.department or None),
-                consultant_name=consultant_name,
-                status="em_andamento",
-                notes=self.new_interview_notes.strip(),
-            )
-            session.add(interview)
-            toast_message = "Entrevista criada"
+            session.close()
+            self.toast_message = "Etapa da entrevista nao suporta vínculo de contexto"
+            self.toast_type = "error"
+            return
         session.commit()
-        session.refresh(interview)
         session.close()
-        self.selected_interview_id = str(interview.id)
-        self.selected_form_id = str(interview.survey_id or "")
-        self.interview_answer_map = {}
-        self.interview_score_map = {}
-        self.reset_interview_form()
+        self.select_interview_session(self.selected_interview_id)
         self.toast_message = toast_message
         self.toast_type = "success"
 
-    def start_edit_interview(self, interview_id: str):
+    def _clear_active_interview_state(self):
+        self.selected_interview_id = ""
+        self.selected_form_id = ""
+        self.interview_answer_map = {}
+        self.interview_score_map = {}
+        self.interview_score_touched_ids = []
+        self.editing_interview_id = ""
+        self.cancel_table_edit_interview()
+        self.reset_interview_form()
+
+    def cancel_active_interview(self):
+        self._clear_active_interview_state()
+        self.toast_message = "Entrevista cancelada"
+        self.toast_type = "success"
+
+    def _create_interview_session_record(self, session) -> InterviewSessionModel | None:
+        if not self.new_interview_form_id.isdigit() or not self.new_interview_project_id.isdigit() or not self.new_interview_client_id.isdigit():
+            return None
+        survey = (
+            session.query(SurveyModel)
+            .filter(
+                SurveyModel.id == int(self.new_interview_form_id),
+                SurveyModel.tenant_id == self.current_tenant,
+            )
+            .first()
+        )
+        if not survey:
+            return None
+        stage_name = survey.stage_name or "Visita Técnica - Guiada"
+        interviewee_name = "-"
+        interviewee_role = None
+        interviewee_user_id = int(self.new_interview_user_id) if self.new_interview_user_id.isdigit() else None
+        if stage_name == "Entrevista Individual com o Líder":
+            interviewee = (
+                session.query(UserModel)
+                .filter(
+                    UserModel.id == int(self.new_interview_user_id),
+                    UserModel.account_scope == "cliente",
+                )
+                .first()
+            )
+            if not interviewee or interviewee.client_id != int(self.new_interview_client_id):
+                return None
+            interviewee_name = interviewee.name or interviewee.email
+            interviewee_role = interviewee.profession or interviewee.department or None
+        elif stage_name in {"Rodas de Conversa", "Rodada de Conversa"}:
+            interviewee_user_id = None
+            interviewee_name = self.new_interview_group_name.strip()
+            interviewee_role = self.new_interview_area.strip() or None
+        elif stage_name == "Visita Técnica - Guiada":
+            interviewee_user_id = None
+            interviewee_name = f"Área: {self.new_interview_area.strip()}"
+            interviewee_role = "Observação em campo"
+        interview = InterviewSessionModel(
+            tenant_id=self.current_tenant,
+            form_id=int(survey.legacy_form_id or 0),
+            survey_id=int(self.new_interview_form_id),
+            project_id=int(self.new_interview_project_id),
+            client_id=int(self.new_interview_client_id),
+            interviewee_user_id=interviewee_user_id,
+            target_area=self.new_interview_area.strip() or None,
+            audience_group=self.new_interview_group_name.strip() or None,
+            interview_date=self.new_interview_date.strip() or datetime.utcnow().strftime("%Y-%m-%d"),
+            interviewee_name=interviewee_name,
+            interviewee_role=interviewee_role,
+            consultant_name=self.login_email.strip().lower() or "consultor@smartlab.com",
+            status="em_andamento",
+            notes=self.new_interview_notes.strip(),
+        )
+        session.add(interview)
+        session.flush()
+        return interview
+
+    def start_table_edit_interview(self, interview_id: str):
         if not str(interview_id).isdigit():
             self.toast_message = "Entrevista invalida"
             self.toast_type = "error"
@@ -3355,6 +5646,118 @@ class State(SessionStateMixin):
             self.toast_message = "Entrevista nao encontrada"
             self.toast_type = "error"
             return
+        self.editing_interview_table_id = str(interview.id)
+        self.edit_interview_form_id = str(interview.survey_id or "")
+        self.edit_interview_project_id = str(interview.project_id or "")
+        self.edit_interview_client_id = str(interview.client_id or "")
+        self.edit_interview_date = interview.interview_date or ""
+        self.edit_interview_status = interview.status or "em_andamento"
+        self.select_interview_session(str(interview.id))
+
+    def cancel_table_edit_interview(self):
+        self.editing_interview_table_id = ""
+        self.edit_interview_form_id = ""
+        self.edit_interview_project_id = ""
+        self.edit_interview_client_id = ""
+        self.edit_interview_date = ""
+        self.edit_interview_status = "em_andamento"
+
+    def _save_interview_inline_internal(self, show_toast: bool = True) -> bool:
+        if not self.editing_interview_table_id.isdigit():
+            if show_toast:
+                self.toast_message = "Nenhuma entrevista em edição"
+                self.toast_type = "error"
+            return False
+        if not self.edit_interview_project_id.isdigit():
+            if show_toast:
+                self.toast_message = "Selecione o projeto contratado"
+                self.toast_type = "error"
+            return False
+        if not self.edit_interview_form_id.isdigit():
+            if show_toast:
+                self.toast_message = "Selecione a pesquisa"
+                self.toast_type = "error"
+            return False
+        session = SessionLocal()
+        interview = (
+            session.query(InterviewSessionModel)
+            .filter(
+                InterviewSessionModel.id == int(self.editing_interview_table_id),
+                InterviewSessionModel.tenant_id == self.current_tenant,
+            )
+            .first()
+        )
+        project = (
+            session.query(ProjectModel)
+            .filter(
+                ProjectModel.id == int(self.edit_interview_project_id),
+                ProjectModel.tenant_id == self.current_tenant,
+            )
+            .first()
+        )
+        survey = (
+            session.query(SurveyModel)
+            .filter(
+                SurveyModel.id == int(self.edit_interview_form_id),
+                SurveyModel.tenant_id == self.current_tenant,
+            )
+            .first()
+        )
+        if not interview or not project or not survey:
+            session.close()
+            if show_toast:
+                self.toast_message = "Entrevista, projeto ou pesquisa não encontrados"
+                self.toast_type = "error"
+            return False
+        interview.project_id = int(project.id)
+        interview.client_id = int(project.client_id) if project.client_id is not None else None
+        interview.survey_id = int(survey.id)
+        interview.form_id = int(survey.legacy_form_id or 0)
+        interview.interview_date = self.edit_interview_date.strip() or interview.interview_date or datetime.utcnow().strftime("%Y-%m-%d")
+        interview.status = self.edit_interview_status or "em_andamento"
+        session.commit()
+        session.close()
+        if self.selected_interview_id == self.editing_interview_table_id:
+            self.select_interview_session(self.selected_interview_id)
+        if show_toast:
+            self.cancel_table_edit_interview()
+            self.toast_message = "Entrevista atualizada"
+            self.toast_type = "success"
+        return True
+
+    def save_interview_inline(self):
+        metadata_saved = self._save_interview_inline_internal(show_toast=False)
+        if not metadata_saved:
+            return
+        saved_responses = True
+        if self.selected_interview_id == self.editing_interview_table_id:
+            saved_responses = self._save_interview_responses_internal()
+        if not saved_responses:
+            return
+        self._clear_active_interview_state()
+        self.toast_message = "Entrevista atualizada"
+        self.toast_type = "success"
+
+    def start_edit_interview(self, interview_id: str):
+        if not str(interview_id).isdigit():
+            self.toast_message = "Entrevista invalida"
+            self.toast_type = "error"
+            return
+        session = SessionLocal()
+        interview = (
+            session.query(InterviewSessionModel)
+            .filter(
+                InterviewSessionModel.id == int(interview_id),
+                InterviewSessionModel.tenant_id == self.current_tenant,
+            )
+            .first()
+        )
+        if not interview:
+            session.close()
+            self.toast_message = "Entrevista nao encontrada"
+            self.toast_type = "error"
+            return
+        self.new_interview_project_id = str(interview.project_id or "")
         response_rows = (
             session.query(ResponseModel)
             .filter(
@@ -3363,14 +5766,18 @@ class State(SessionStateMixin):
             )
             .all()
         )
+        session.close()
         self.editing_interview_id = str(interview.id)
         self.selected_interview_id = str(interview.id)
         self.selected_form_id = str(interview.survey_id or "")
         self.new_interview_form_id = str(interview.survey_id or "")
         self.new_interview_client_id = str(interview.client_id or "")
         self.new_interview_user_id = str(interview.interviewee_user_id or "")
+        self.new_interview_area = interview.target_area or ""
+        self.new_interview_group_name = interview.audience_group or ""
         self.new_interview_date = interview.interview_date or ""
         self.new_interview_notes = interview.notes or ""
+        self.interview_draft_active = False
         self.interview_answer_map = {
             str(row.question_id): row.answer or ""
             for row in response_rows
@@ -3381,6 +5788,7 @@ class State(SessionStateMixin):
             for row in response_rows
             if row.question_id is not None
         }
+        self.interview_score_touched_ids = [str(row.question_id) for row in response_rows if row.question_id is not None]
         self.toast_message = "Entrevista carregada para alteracao"
         self.toast_type = "success"
 
@@ -3415,6 +5823,8 @@ class State(SessionStateMixin):
             self.selected_form_id = ""
             self.interview_answer_map = {}
             self.interview_score_map = {}
+            self.interview_score_touched_ids = []
+            self.interview_draft_active = False
         if self.editing_interview_id == str(interview_id):
             self.reset_interview_form()
         self.toast_message = "Entrevista excluida"
@@ -3425,6 +5835,8 @@ class State(SessionStateMixin):
         if not str(interview_id).isdigit():
             self.interview_answer_map = {}
             self.interview_score_map = {}
+            self.interview_score_touched_ids = []
+            self.interview_draft_active = False
             return
         session = SessionLocal()
         interview = (
@@ -3436,7 +5848,16 @@ class State(SessionStateMixin):
             .first()
         )
         if interview:
+            self.interview_draft_active = False
             self.selected_form_id = str(interview.survey_id or "")
+            self.new_interview_project_id = str(interview.project_id or "")
+            self.new_interview_form_id = str(interview.survey_id or "")
+            self.new_interview_client_id = str(interview.client_id or "")
+            self.new_interview_user_id = str(interview.interviewee_user_id or "")
+            self.new_interview_area = interview.target_area or ""
+            self.new_interview_group_name = interview.audience_group or ""
+            self.new_interview_date = interview.interview_date or ""
+            self.new_interview_notes = interview.notes or ""
             response_rows = (
                 session.query(ResponseModel)
                 .filter(
@@ -3455,28 +5876,41 @@ class State(SessionStateMixin):
                 for row in response_rows
                 if row.question_id is not None
             }
+            self.interview_score_touched_ids = [str(row.question_id) for row in response_rows if row.question_id is not None]
         else:
             self.interview_answer_map = {}
             self.interview_score_map = {}
+            self.interview_score_touched_ids = []
         session.close()
 
     def _save_interview_responses_internal(self) -> bool:
+        created_draft_record = False
         if not self.selected_interview_id.isdigit():
-            self.toast_message = "Selecione uma entrevista ativa"
-            self.toast_type = "error"
-            return False
+            if not self.interview_draft_active:
+                self.toast_message = "Selecione uma entrevista ativa"
+                self.toast_type = "error"
+                return False
+            if not self.active_interview_context_ready:
+                self.toast_message = "Defina o contexto da entrevista antes de salvar"
+                self.toast_type = "error"
+                return False
         session = SessionLocal()
-        interview = (
-            session.query(InterviewSessionModel)
-            .filter(
-                InterviewSessionModel.id == int(self.selected_interview_id),
-                InterviewSessionModel.tenant_id == self.current_tenant,
+        interview = None
+        if self.selected_interview_id.isdigit():
+            interview = (
+                session.query(InterviewSessionModel)
+                .filter(
+                    InterviewSessionModel.id == int(self.selected_interview_id),
+                    InterviewSessionModel.tenant_id == self.current_tenant,
+                )
+                .first()
             )
-            .first()
-        )
+        else:
+            interview = self._create_interview_session_record(session)
+            created_draft_record = interview is not None
         if not interview:
             session.close()
-            self.toast_message = "Entrevista nao encontrada"
+            self.toast_message = "Entrevista nao encontrada ou contexto invalido"
             self.toast_type = "error"
             return False
         questions = (
@@ -3492,6 +5926,7 @@ class State(SessionStateMixin):
             survey = session.query(SurveyModel).filter(SurveyModel.id == int(interview.survey_id)).first()
         service_name = survey.service_name if survey else self.selected_interview_record["form_name"]
         saved_count = 0
+        answered_count = 0
         for question in questions:
             question_id = str(question.id)
             existing = (
@@ -3513,6 +5948,7 @@ class State(SessionStateMixin):
                 score = int(existing.score or 0) if existing else 0
             else:
                 score = int(score_raw) if str(score_raw).lstrip("-").isdigit() else 0
+            score_touched = question_id in self.interview_score_touched_ids or existing is not None
             if existing:
                 existing.answer = answer
                 existing.score = score
@@ -3540,6 +5976,8 @@ class State(SessionStateMixin):
                     )
                 )
             saved_count += 1
+            if score_touched:
+                answered_count += 1
         if saved_count == 0:
             session.close()
             self.toast_message = "Nenhuma resposta preenchida para salvar"
@@ -3565,20 +6003,26 @@ class State(SessionStateMixin):
             total_score += weighted_score
         interview.total_score = total_score
         interview.dimension_scores_json = json.dumps(dimension_scores)
+        interview.status = "concluida" if questions and answered_count == len(questions) else "em_andamento"
         session.commit()
+        if created_draft_record:
+            self.selected_interview_id = str(interview.id)
+            self.interview_draft_active = False
+            self.interview_score_touched_ids = [str(question.id) for question in questions if str(question.id) in self.interview_score_touched_ids]
         session.close()
-        self.toast_message = "Respostas da entrevista salvas"
+        self.toast_message = "Entrevista e respostas salvas" if created_draft_record else "Respostas da entrevista salvas"
         self.toast_type = "success"
         return True
 
     def save_interview_responses(self):
+        metadata_saved = True
+        if self.editing_interview_table_id and self.selected_interview_id == self.editing_interview_table_id:
+            metadata_saved = self._save_interview_inline_internal(show_toast=False)
+        if not metadata_saved:
+            return
         saved = self._save_interview_responses_internal()
         if saved:
-            self.selected_interview_id = ""
-            self.selected_form_id = ""
-            self.interview_answer_map = {}
-            self.interview_score_map = {}
-            self.editing_interview_id = ""
+            self._clear_active_interview_state()
 
     def update_interview_status(self, status: str):
         if not self.selected_interview_id.isdigit():
@@ -3765,20 +6209,64 @@ class State(SessionStateMixin):
             self.toast_message = "Informe o nome do projeto"
             self.toast_type = "error"
             return
+        if not self.new_project_client_id.isdigit():
+            self.toast_message = "Selecione o cliente que contratou o serviço"
+            self.toast_type = "error"
+            return
+        service_name = self.effective_new_project_service_name.strip()
+        if self.new_project_service_name == "Outro" and not self.new_project_custom_service_name.strip():
+            self.toast_message = "Informe o nome do novo serviço SmartLab"
+            self.toast_type = "error"
+            return
+        project_name = self.new_project_name.strip()
+        contracted_at = self.new_project_contracted_at.strip() or datetime.utcnow().strftime("%Y-%m-%d")
         session = SessionLocal()
+        duplicate = (
+            session.query(ProjectModel)
+            .filter(
+                ProjectModel.tenant_id == self.current_tenant,
+                ProjectModel.name == project_name,
+                ProjectModel.service_name == service_name,
+                ProjectModel.client_id == int(self.new_project_client_id),
+                ProjectModel.contracted_at == contracted_at,
+            )
+            .first()
+        )
+        if duplicate:
+            self.selected_project_id = str(duplicate.id)
+            session.close()
+            self.toast_message = "Já existe um projeto com esse nome, cliente, serviço e data"
+            self.toast_type = "error"
+            return
         project = ProjectModel(
             tenant_id=self.current_tenant,
-            name=self.new_project_name,
+            name=project_name,
             project_type=self.new_project_type,
+            service_name=service_name,
+            client_id=int(self.new_project_client_id),
+            contracted_at=contracted_at,
             status="planejamento",
             progress=0,
         )
         session.add(project)
         session.commit()
         session.refresh(project)
+        session.add(
+            ProjectAssignmentModel(
+                project_id=int(project.id),
+                tenant_id=self.current_tenant,
+                client_id=int(self.new_project_client_id),
+            )
+        )
+        session.commit()
+        project_id = int(project.id)
         session.close()
-        self.selected_project_id = str(project.id)
+        self.selected_project_id = str(project_id)
         self.new_project_name = ""
+        self.new_project_client_id = ""
+        self.new_project_contracted_at = ""
+        self.new_project_service_name = "Diagnóstico Cultura de Segurança"
+        self.new_project_custom_service_name = ""
         self.toast_message = "Projeto criado"
         self.toast_type = "success"
         self.sync_project_assignments()
@@ -4038,11 +6526,21 @@ class State(SessionStateMixin):
             self.toast_type = "error"
             return
         session = SessionLocal()
+        action_title = self.new_action_title
+        project_row = (
+            session.query(ProjectModel)
+            .filter(ProjectModel.id == int(self.selected_project_id), ProjectModel.tenant_id == self.selected_project_source_tenant)
+            .first()
+        )
         session.add(
             ActionPlanModel(
-                tenant_id=self.current_tenant,
+                tenant_id=self.selected_project_source_tenant,
                 project_id=int(self.selected_project_id),
-                title=self.new_action_title,
+                client_id=int(project_row.client_id) if project_row and project_row.client_id is not None else None,
+                service_name=(project_row.service_name if project_row else self.selected_project_record["service_name"]),
+                dimension_names=self.new_action_dimensions.strip(),
+                target_area=self.new_action_area.strip(),
+                title=action_title,
                 owner=self.new_action_owner,
                 due_date=self.new_action_due_date,
                 status="a_fazer",
@@ -4056,6 +6554,9 @@ class State(SessionStateMixin):
         self.new_action_owner = ""
         self.new_action_due_date = ""
         self.new_action_expected_result = ""
+        self.new_action_dimensions = ""
+        self.new_action_area = ""
+        self._append_audit_entry("action.create", f"Ação criada: {action_title}", "operations")
         self.toast_message = "Ação criada"
         self.toast_type = "success"
 
@@ -4073,8 +6574,10 @@ class State(SessionStateMixin):
         if status == "concluido" and row.attainment < 100:
             row.attainment = 100
             row.actual_result = row.actual_result or "Concluído conforme planejado."
+        action_title = row.title
         session.commit()
         session.close()
+        self._append_audit_entry("action.status", f"Ação '{action_title}' movida para {status}", "operations")
         self.toast_message = "Status atualizado"
         self.toast_type = "success"
 
@@ -4255,52 +6758,322 @@ class State(SessionStateMixin):
             self.toast_type = "error"
             return
 
-        upload_dir = Path(str(rx.get_upload_dir())) / "resources"
+        knowledge_scope = self.ai_knowledge_scope_effective
+        target_tenant = "default" if knowledge_scope == "smartlab" else (self.selected_project_source_tenant if self.ai_scope_mode_effective == "projeto" else self.current_tenant)
+        project_scope = (
+            "smartlab"
+            if knowledge_scope == "smartlab"
+            else (self.selected_project_id if self.ai_scope_mode_effective == "projeto" and self.selected_project_id and self.selected_project_id.isdigit() else "tenant")
+        )
+        upload_dir = Path(str(rx.get_upload_dir())) / "assistant_resources" / target_tenant / str(project_scope)
         upload_dir.mkdir(parents=True, exist_ok=True)
         saved_files: list[str] = []
+        indexing_notes: list[str] = []
+        unsupported_files: list[str] = []
+        session = SessionLocal()
+        allowed_suffixes = {".pdf", ".docx", ".xlsx", ".txt", ".md", ".csv", ".json"}
 
         for file in files:
             file_name = file.filename or "arquivo.bin"
             safe_name = file_name.replace("..", "").replace("/", "_").replace("\\", "_")
+            suffix = Path(safe_name).suffix.lower()
+            if suffix not in allowed_suffixes:
+                unsupported_files.append(safe_name)
+                continue
+            stored_name = f"{datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{secrets.token_hex(4)}_{safe_name}"
             file_bytes = await file.read()
-            (upload_dir / safe_name).write_bytes(file_bytes)
+            stored_path = upload_dir / stored_name
+            stored_path.write_bytes(file_bytes)
             saved_files.append(safe_name)
+            document = AssistantDocumentModel(
+                tenant_id=target_tenant,
+                project_id=(
+                    int(self.selected_project_id)
+                    if knowledge_scope != "smartlab" and self.ai_scope_mode_effective == "projeto" and self.selected_project_id and self.selected_project_id.isdigit()
+                    else None
+                ),
+                knowledge_scope=knowledge_scope,
+                file_name=safe_name,
+                file_path=str(stored_path),
+                resource_type=self.ai_resource_type,
+                file_size=len(file_bytes),
+                uploaded_by=self.login_email.strip().lower() or "sistema",
+            )
+            session.add(document)
+            session.flush()
+            chunk_count, retrieval_mode = self._index_assistant_document(session, document)
+            indexing_notes.append(f"{safe_name}: {chunk_count} chunk(s), modo {retrieval_mode}")
 
+        session.commit()
+        session.close()
         self.uploaded_resources = saved_files + self.uploaded_resources
-        self.toast_message = f"{len(saved_files)} arquivo(s) enviado(s) com sucesso"
+        self._append_audit_entry(
+            "assistant.upload",
+            f"{len(saved_files)} arquivo(s) enviados para {target_tenant}/{project_scope}: {', '.join(saved_files)}",
+            "assistant",
+            {
+                "knowledge_scope": knowledge_scope,
+                "sources": " | ".join(indexing_notes),
+            },
+        )
+        if not saved_files and unsupported_files:
+            self.toast_message = "Formatos suportados: PDF, Word (.docx), Excel (.xlsx), TXT, CSV e JSON"
+            self.toast_type = "error"
+            return
+        detail = f"{len(saved_files)} arquivo(s) enviado(s) com sucesso"
+        if unsupported_files:
+            detail += f" | Ignorados: {', '.join(unsupported_files)}"
+        self.toast_message = detail
+        self.toast_type = "success" if saved_files else "error"
+
+    def delete_ai_document(self, document_id: str):
+        if not document_id.isdigit():
+            return
+        session = SessionLocal()
+        row = session.query(AssistantDocumentModel).filter(AssistantDocumentModel.id == int(document_id)).first()
+        if not row:
+            session.close()
+            return
+        if row.knowledge_scope == "smartlab" and self.user_scope != "smartlab":
+            session.close()
+            self.toast_message = "Somente a SmartLab pode remover documentos da base mestre"
+            self.toast_type = "error"
+            return
+        target_tenant = self.selected_project_source_tenant if self.selected_project_id else self.current_tenant
+        if row.knowledge_scope != "smartlab" and row.tenant_id != target_tenant:
+            session.close()
+            return
+        file_path = Path(row.file_path)
+        if file_path.exists():
+            file_path.unlink()
+        removed_name = row.file_name
+        session.query(AssistantChunkModel).filter(AssistantChunkModel.document_id == int(row.id)).delete()
+        session.delete(row)
+        session.commit()
+        session.close()
+        self._append_audit_entry("assistant.document.delete", f"Documento removido: {removed_name}", "assistant")
+        self.toast_message = "Documento removido do contexto da IA"
+        self.toast_type = "success"
+
+    def promote_ai_action(self, title: str, owner: str, due_date: str, expected_result: str):
+        if not self.selected_project_id or not self.selected_project_id.isdigit():
+            self.toast_message = "Selecione um projeto antes de enviar a recomendação para o Plano de Ação"
+            self.toast_type = "error"
+            return
+        session = SessionLocal()
+        project_row = (
+            session.query(ProjectModel)
+            .filter(ProjectModel.id == int(self.selected_project_id), ProjectModel.tenant_id == self.selected_project_source_tenant)
+            .first()
+        )
+        session.add(
+            ActionPlanModel(
+                tenant_id=self.selected_project_source_tenant,
+                project_id=int(self.selected_project_id),
+                client_id=int(project_row.client_id) if project_row and project_row.client_id is not None else None,
+                service_name=(project_row.service_name if project_row else self.selected_project_record["service_name"]),
+                dimension_names="",
+                target_area="",
+                title=title,
+                owner=owner or "Consultoria SmartLab",
+                due_date=due_date,
+                status="a_fazer",
+                expected_result=expected_result,
+                attainment=0,
+            )
+        )
+        session.commit()
+        session.close()
+        self._append_audit_entry("assistant.action.promote", f"Recomendação enviada ao plano: {title}", "assistant")
+        self.toast_message = "Recomendação enviada ao Plano de Ação"
         self.toast_type = "success"
 
     def ask_ai(self):
-        prompt = (self.ai_prompt or "").lower()
+        prompt = (self.ai_prompt or "").strip()
+        if not prompt:
+            self.toast_message = "Escreva uma pergunta ou objetivo para o Especialista IA"
+            self.toast_type = "error"
+            return
+
         rows = self.dashboard_table
-        avg = 0.0
-        if rows:
-            avg = round(sum(float(r["media"]) for r in rows) / len(rows), 2)
-
-        recommendation = [
-            "Recomendação prática: priorize rituais de liderança visível em segurança e ajuste metas para evitar pressão insegura.",
-            "Mapeie comportamentos críticos por turno e vincule feedbacks semanais com ações corretivas rápidas.",
-            "Use os formulários para comparar Segurança vs Produtividade por área e atacar desvios com plano de 30-60-90 dias.",
-        ]
-        if "press" in prompt or "pressao" in prompt:
-            recommendation.append(
-                "Impacto da pressão: reduza conflitos de prioridade com regras claras de parada segura e escalonamento de risco."
+        avg = round(sum(float(r["media"]) for r in rows) / len(rows), 2) if rows else 0.0
+        low_rows = [r for r in rows if r["status"] in {"Crítico", "Moderado"}]
+        docs = self.ai_documents_data[:6]
+        doc_summary = ", ".join(f'{item["file_name"]} ({item["resource_type"]})' for item in docs) or "Sem documentos anexados"
+        risk_summary = ", ".join(f'{item["form"]}: {item["status"]} ({item["media"]})' for item in low_rows[:4]) or "Sem criticidades explícitas no dashboard"
+        context = self.ai_context_summary
+        insights = self.ai_response_insights
+        retrieved_chunks = self._retrieve_ai_chunks(prompt, limit=6)
+        rag_sources = ", ".join(
+            f'{item["file_name"]} [{item["project_scope"]}]'
+            for item in retrieved_chunks
+        ) or "Sem fontes recuperadas"
+        rag_context = "\n\n".join(
+            f"Fonte {index + 1}: {item['file_name']} | {item['resource_type']} | {item['project_scope']} | score {item['score']}\nTrecho: {item['content']}"
+            for index, item in enumerate(retrieved_chunks)
+        ) or "Nenhum trecho documental foi recuperado para esta pergunta."
+        respondent_summary = ", ".join(
+            f"{item['name']} ({item['responses']} respostas)"
+            for item in insights["respondent_breakdown"][:6]
+        ) or "Nenhum respondente identificado"
+        company_summary = ", ".join(
+            f"{item['name']} ({item['responses']} respostas)"
+            for item in insights["company_breakdown"][:6]
+        ) or "Nenhuma empresa identificada"
+        factual_answer = self._build_ai_factual_answer(prompt, insights)
+        if factual_answer:
+            self.ai_answer = factual_answer
+            self.ai_history = self.ai_history + [
+                {
+                    "asked_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                    "question": prompt,
+                    "answer": factual_answer,
+                    "model": "banco_local",
+                    "scope": self.ai_scope_mode_effective,
+                }
+            ]
+            self.ai_prompt = ""
+            self._append_audit_entry(
+                "assistant.ask.factual",
+                "Pergunta respondida diretamente pelo banco local",
+                "assistant",
+                {
+                    "question": prompt,
+                    "answer": factual_answer,
+                    "model": "banco_local",
+                    "assistant_scope": self.ai_scope_mode_effective,
+                    "answer_mode": "factual",
+                    "sources": rag_sources,
+                },
             )
-        if "lider" in prompt:
-            recommendation.append(
-                "Maturidade da liderança: treine líderes para abrir reuniões com aprendizados de quase acidentes e ações preventivas."
-            )
-        if "dashboard" in prompt:
-            recommendation.append(
-                "Leitura de dashboard: categorias abaixo de 2.5 são críticas e exigem intervenção imediata com owner definido."
-            )
-
-        self.ai_answer = (
-            f"Assistente SSecur1 IA\n"
-            f"Média geral atual: {avg}\n"
-            f"Resumo: {' '.join(recommendation[:4])}\n"
-            "Benefício esperado: decisões estratégicas mais acertadas, redução de riscos e integração segurança-produtividade."
+            self.toast_message = "Resposta factual gerada diretamente do banco"
+            self.toast_type = "success"
+            return
+        compiled_prompt = (
+            "Você é o Especialista IA interno da SmartLab, rodando localmente e sem usar dados fora da plataforma.\n"
+            "Nunca misture tenants. Responda apenas com base no contexto abaixo.\n\n"
+            f"Tenant ativo: {context['tenant']}\n"
+            f"Projeto selecionado: {self.selected_project_option or 'não selecionado'}\n"
+            f"Documentos disponíveis: {context['documents']}\n"
+            f"Base SmartLab disponível: {context['smartlab_documents']}\n"
+            f"Chunks RAG disponíveis: {context['chunks']}\n"
+            f"Documentos do tenant/projeto: {context['tenant_documents']}\n"
+            f"Formulários ativos: {context['forms']}\n"
+            f"Entrevistas: {context['interviews']}\n"
+            f"Respostas vinculadas: {context['responses']}\n"
+            f"Respondentes identificados: {respondent_summary}\n"
+            f"Empresas identificadas: {company_summary}\n"
+            f"Ações em aberto: {context['actions_open']}\n"
+            f"Média geral do dashboard: {avg}\n"
+            f"Principais alertas: {risk_summary}\n"
+            f"Fontes documentais: {doc_summary}\n\n"
+            "Trechos recuperados por RAG:\n"
+            f"{rag_context}\n\n"
+            "Objetivo do usuário:\n"
+            f"{prompt}\n\n"
+            "Entregue uma resposta objetiva com:\n"
+            "1. leitura executiva;\n"
+            "2. lacunas prováveis entre respostas e políticas;\n"
+            "3. ações priorizadas;\n"
+            "4. riscos de governança se faltar evidência documental.\n"
+            "5. cite as fontes usadas pelo nome do arquivo.\n"
         )
+
+        model_name = self.ai_selected_model_effective
+        answer = ""
+        if model_name != "Nenhum modelo local disponível":
+            answer = _run_ollama_command("run", model_name, input_text=compiled_prompt, timeout=120)
+
+        if answer:
+            self.ai_history = self.ai_history + [
+                {
+                    "asked_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                    "question": prompt,
+                    "answer": answer,
+                    "model": model_name,
+                    "scope": self.ai_scope_mode_effective,
+                }
+            ]
+            self.ai_answer = answer
+            self.ai_prompt = ""
+            self._append_audit_entry(
+                "assistant.ask",
+                f"Pergunta respondida com {model_name}",
+                "assistant",
+                {
+                    "question": prompt,
+                    "answer": answer,
+                    "model": model_name,
+                    "assistant_scope": self.ai_scope_mode_effective,
+                    "answer_mode": "llm",
+                    "sources": rag_sources,
+                },
+            )
+            self.toast_message = f"Resposta gerada com {model_name}"
+            self.toast_type = "success"
+            return
+
+        prompt_lower = prompt.lower()
+        if any(term in prompt_lower for term in ["quantas respostas", "qtd respostas", "numero de respostas", "número de respostas"]):
+            names = ", ".join(insights["respondent_names"]) or "nenhum nome identificado"
+            self.ai_answer = (
+                "Especialista IA SSecur1\n"
+                f"No contexto atual tivemos {insights['total_responses']} respostas registradas.\n"
+                f"Respondentes identificados: {names}.\n"
+                f"Entrevistas relacionadas: {insights['total_interviews']}."
+            )
+        elif any(term in prompt_lower for term in ["quem respondeu", "nomes", "quem foram", "quais pessoas"]):
+            breakdown = "\n".join(
+                f"- {item['name']}: {item['responses']} respostas"
+                for item in insights["respondent_breakdown"]
+            ) or "- Nenhum respondente identificado"
+            self.ai_answer = (
+                "Especialista IA SSecur1\n"
+                "Respondentes identificados no contexto atual:\n"
+                f"{breakdown}"
+            )
+        else:
+            recommendation = [
+            "Leitura executiva: concentre a análise nas dimensões com maior fricção entre segurança e produtividade.",
+            "Lacunas prováveis: valide se as respostas críticas possuem política, procedimento e evidência anexada no mesmo tenant.",
+            "Ações priorizadas: converta cada achado crítico em ação 30-60-90 com responsável, prazo e evidência esperada.",
+            "Governança: não promova conclusão sem documento de suporte e mantenha o contexto isolado por tenant/projeto.",
+            ]
+            self.ai_answer = (
+                "Especialista IA SSecur1\n"
+                f"Modo local preparado, mas sem resposta do runtime {model_name}.\n"
+                f"Tenant: {context['tenant']} | Projeto: {self.selected_project_option or '-'}\n"
+                f"Média geral atual: {avg}\n"
+                f"Fontes: {context['documents']} documentos, {context['chunks']} chunks RAG, {insights['total_responses']} respostas, {context['actions_open']} ações abertas.\n"
+                f"RAG: {rag_sources}.\n"
+                f"Respondentes: {respondent_summary}.\n"
+                f"Resumo: {' '.join(recommendation)}"
+            )
+        self.ai_history = self.ai_history + [
+            {
+                "asked_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                "question": prompt,
+                "answer": self.ai_answer,
+                "model": model_name,
+                "scope": self.ai_scope_mode_effective,
+            }
+        ]
+        self.ai_prompt = ""
+        self._append_audit_entry(
+            "assistant.ask.fallback",
+            f"Pergunta atendida em modo heurístico; modelo {model_name}",
+            "assistant",
+            {
+                "question": prompt,
+                "answer": self.ai_answer,
+                "model": model_name,
+                "assistant_scope": self.ai_scope_mode_effective,
+                "answer_mode": "fallback",
+                "sources": rag_sources,
+            },
+        )
+        self.toast_message = "Runtime local indisponível; análise heurística apresentada"
+        self.toast_type = "error"
 
 
 CARD_STYLE = {
@@ -4360,6 +7133,19 @@ def field_block(label: str, control: rx.Component, help_text: str = "") -> rx.Co
     return build_field_block(label=label, control=control, help_text=help_text)
 
 
+def custom_option_field(label: str, value: rx.Var, on_change, on_confirm, placeholder: str, help_text: str = "") -> rx.Component:
+    from ssecur1.ui.common import build_custom_option_field
+
+    return build_custom_option_field(
+        label=label,
+        value=value,
+        on_change=on_change,
+        on_confirm=on_confirm,
+        placeholder=placeholder,
+        help_text=help_text,
+    )
+
+
 def table_text_cell(primary: rx.Component, secondary: rx.Component | None = None) -> rx.Component:
     from ssecur1.ui.common import build_table_text_cell
 
@@ -4390,6 +7176,12 @@ def apis_view() -> rx.Component:
     return build_apis_view(State=State, CARD_STYLE=CARD_STYLE, data_table=data_table)
 
 
+def auditoria_view() -> rx.Component:
+    from ssecur1.ui.operacoes import build_auditoria_view
+
+    return build_auditoria_view(State=State, CARD_STYLE=CARD_STYLE)
+
+
 def dashboard_view() -> rx.Component:
     from ssecur1.ui.operacoes import build_dashboard_view
 
@@ -4407,6 +7199,7 @@ def projetos_view() -> rx.Component:
     return build_projetos_view(
         State=State,
         CARD_STYLE=CARD_STYLE,
+        custom_option_field=custom_option_field,
         workflow_node=workflow_node,
         workflow_connection_line=workflow_connection_line,
         pesquisa_builder_view=pesquisa_builder_view,
@@ -4439,6 +7232,7 @@ def clientes_view() -> rx.Component:
         State=State,
         CARD_STYLE=CARD_STYLE,
         field_block=field_block,
+        custom_option_field=custom_option_field,
         table_text_cell=table_text_cell,
         data_table=data_table,
     )
@@ -4451,6 +7245,7 @@ def usuarios_view() -> rx.Component:
         State=State,
         CARD_STYLE=CARD_STYLE,
         field_block=field_block,
+        custom_option_field=custom_option_field,
         table_text_cell=table_text_cell,
         data_table=data_table,
     )
@@ -4497,6 +7292,7 @@ def pesquisa_builder_view() -> rx.Component:
         State=State,
         CARD_STYLE=CARD_STYLE,
         field_block=field_block,
+        custom_option_field=custom_option_field,
         data_table=data_table,
     )
 
@@ -4529,6 +7325,7 @@ def workspace_view() -> rx.Component:
         app_header=app_header,
         dashboard_view=dashboard_view,
         apis_view=apis_view,
+        auditoria_view=auditoria_view,
         projetos_view=projetos_view,
         planos_view=planos_view,
         permissoes_view=permissoes_view,

@@ -167,13 +167,14 @@ def build_sidebar(State, nav_button) -> rx.Component:
         rx.cond(State.show_menu_plans, nav_button("Plano de Ação", "list_todo", "planos"), rx.fragment()),
         rx.cond(State.show_menu_dashboard, nav_button("Dashboard", "layout_dashboard", "dashboard"), rx.fragment()),
         rx.cond(State.show_menu_apis, nav_button("APIs", "plug", "apis"), rx.fragment()),
+        rx.cond(State.show_menu_audit, nav_button("Auditoria", "file_search", "auditoria"), rx.fragment()),
         rx.cond(State.show_menu_roles, nav_button("Papéis", "shield_check", "papeis"), rx.fragment()),
         rx.cond(
             State.show_menu_responsibilities,
             nav_button("Responsabilidades", "clipboard_list", "responsabilidades"),
             rx.fragment(),
         ),
-        rx.cond(State.show_menu_ai, nav_button("Assistente IA", "sparkles", "ia"), rx.fragment()),
+        rx.cond(State.show_menu_ai, nav_button("Especialista IA", "sparkles", "ia"), rx.fragment()),
         width="100%",
         spacing="2",
     )
@@ -251,6 +252,51 @@ def build_field_block(label: str, control: rx.Component, help_text: str = "") ->
         align="start",
         width="100%",
         class_name="field-block",
+    )
+
+
+def build_custom_option_field(
+    label: str,
+    value: rx.Var,
+    on_change,
+    on_confirm,
+    placeholder: str,
+    help_text: str = "",
+) -> rx.Component:
+    return build_field_block(
+        label,
+        rx.vstack(
+            rx.hstack(
+                rx.input(
+                    placeholder=placeholder,
+                    value=value,
+                    on_change=on_change,
+                    bg="transparent",
+                    color="var(--text-primary)",
+                    width="100%",
+                    border="0",
+                    box_shadow="none",
+                    class_name="custom-option-input",
+                ),
+                rx.button(
+                    "OK",
+                    on_click=on_confirm,
+                    class_name="custom-option-ok",
+                ),
+                width="100%",
+                align="center",
+                spacing="2",
+                class_name="custom-option-shell",
+            ),
+            rx.cond(
+                help_text != "",
+                rx.text(help_text, color="var(--text-muted)", font_size="0.76rem", width="100%"),
+                rx.fragment(),
+            ),
+            width="100%",
+            spacing="1",
+            align="start",
+        ),
     )
 
 

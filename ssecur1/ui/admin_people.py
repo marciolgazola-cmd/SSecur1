@@ -3,7 +3,7 @@ from typing import Any
 import reflex as rx
 
 
-def build_clientes_view(State, CARD_STYLE: dict[str, Any], field_block, table_text_cell, data_table) -> rx.Component:
+def build_clientes_view(State, CARD_STYLE: dict[str, Any], field_block, custom_option_field, table_text_cell, data_table) -> rx.Component:
     client_table_headers = [
         "ID",
         "Cliente",
@@ -145,17 +145,13 @@ def build_clientes_view(State, CARD_STYLE: dict[str, Any], field_block, table_te
                     ),
                     rx.cond(
                         State.new_client_business_sector == "Outro",
-                        field_block(
+                        custom_option_field(
                             "Novo ramo",
-                            rx.input(
-                                placeholder="Informe o ramo de atividade",
-                                value=State.new_client_custom_business_sector,
-                                on_change=State.set_new_client_custom_business_sector,
-                                bg="var(--input-bg)",
-                                color="var(--text-primary)",
-                                width="100%",
-                            ),
-                            "Ao salvar, o novo ramo passa a fazer parte da lista de selecao deste tenant.",
+                            value=State.new_client_custom_business_sector,
+                            on_change=State.set_new_client_custom_business_sector,
+                            on_confirm=State.confirm_new_client_business_sector,
+                            placeholder="Informe o ramo de atividade",
+                            help_text="Ao salvar, o novo ramo passa a fazer parte da lista de selecao deste tenant.",
                         ),
                         rx.fragment(),
                     ),
@@ -394,7 +390,7 @@ def build_clientes_view(State, CARD_STYLE: dict[str, Any], field_block, table_te
     )
 
 
-def build_usuarios_view(State, CARD_STYLE: dict[str, Any], field_block, table_text_cell, data_table) -> rx.Component:
+def build_usuarios_view(State, CARD_STYLE: dict[str, Any], field_block, custom_option_field, table_text_cell, data_table) -> rx.Component:
     user_table_headers = ["Nome", "Acesso", "Organização", "Workspace", "Ações"]
 
     def user_table_cell(*children: rx.Component) -> rx.Component:
@@ -613,16 +609,12 @@ def build_usuarios_view(State, CARD_STYLE: dict[str, Any], field_block, table_te
                     ),
                     rx.cond(
                         State.new_user_profession == "Outro",
-                        field_block(
+                        custom_option_field(
                             "Nova profissao",
-                            rx.input(
-                                placeholder="Informe a profissao",
-                                value=State.new_user_custom_profession,
-                                on_change=State.set_new_user_custom_profession,
-                                bg="var(--input-bg)",
-                                color="var(--text-primary)",
-                                width="100%",
-                            ),
+                            value=State.new_user_custom_profession,
+                            on_change=State.set_new_user_custom_profession,
+                            on_confirm=State.confirm_new_user_profession,
+                            placeholder="Informe a profissao",
                         ),
                         rx.fragment(),
                     ),
@@ -651,16 +643,12 @@ def build_usuarios_view(State, CARD_STYLE: dict[str, Any], field_block, table_te
                     ),
                     rx.cond(
                         State.new_user_department == "Outro",
-                        field_block(
+                        custom_option_field(
                             "Novo departamento",
-                            rx.input(
-                                placeholder="Informe o departamento",
-                                value=State.new_user_custom_department,
-                                on_change=State.set_new_user_custom_department,
-                                bg="var(--input-bg)",
-                                color="var(--text-primary)",
-                                width="100%",
-                            ),
+                            value=State.new_user_custom_department,
+                            on_change=State.set_new_user_custom_department,
+                            on_confirm=State.confirm_new_user_department,
+                            placeholder="Informe o departamento",
                         ),
                         rx.fragment(),
                     ),

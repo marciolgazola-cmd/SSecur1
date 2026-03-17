@@ -9,6 +9,7 @@ def build_tenants_view(State, CARD_STYLE: dict[str, Any], field_block, table_tex
         "Workspace",
         "Slug",
         "Cliente proprietário",
+        "Escopo Cliente",
         "Criado em",
         "Limite",
         "Ações",
@@ -31,6 +32,11 @@ def build_tenants_view(State, CARD_STYLE: dict[str, Any], field_block, table_tex
                 rx.hstack(
                     rx.vstack(
                         rx.heading("Tenants", color="var(--text-primary)", size="5"),
+                        rx.text(
+                            "Cada workspace opera com contexto próprio. Documentos, respostas e análises do Especialista IA devem permanecer isolados por tenant.",
+                            color="var(--text-muted)",
+                            font_size="0.88rem",
+                        ),
                         align="start",
                         spacing="1",
                     ),
@@ -75,16 +81,76 @@ def build_tenants_view(State, CARD_STYLE: dict[str, Any], field_block, table_tex
                         ),
                     ),
                     field_block(
-                        "Cliente Vinculo",
-                        rx.select(
-                            State.client_display_options,
-                            value=State.selected_new_tenant_client_option,
-                            on_change=State.set_new_tenant_client_option,
-                            placeholder="Cliente Vinculo",
-                            bg="var(--input-bg)",
-                            color="var(--text-primary)",
+                        "Clientes do tenant",
+                        rx.box(
+                            rx.vstack(
+                                rx.button(
+                                    rx.hstack(
+                                        rx.text(State.selected_tenant_assigned_clients_summary, color="var(--text-primary)"),
+                                        rx.spacer(),
+                                        rx.icon(
+                                            tag=rx.cond(State.new_tenant_assigned_clients_open, "chevron_up", "chevron_down"),
+                                            size=16,
+                                            color="var(--text-muted)",
+                                        ),
+                                        width="100%",
+                                        align="center",
+                                    ),
+                                    on_click=State.toggle_new_tenant_assigned_clients_open,
+                                    variant="ghost",
+                                    border="1px solid var(--input-border)",
+                                    bg="var(--input-bg)",
+                                    width="100%",
+                                    justify_content="flex-start",
+                                ),
+                                rx.cond(
+                                    State.new_tenant_assigned_clients_open,
+                                    rx.foreach(
+                                        State.assignable_client_options,
+                                        lambda client: rx.button(
+                                            rx.hstack(
+                                                rx.badge(
+                                                    rx.cond(
+                                                        State.new_tenant_assigned_client_ids.contains(client["id"]),
+                                                        "No escopo",
+                                                        "Disponível",
+                                                    ),
+                                                    color_scheme=rx.cond(
+                                                        State.new_tenant_assigned_client_ids.contains(client["id"]),
+                                                        "orange",
+                                                        "gray",
+                                                    ),
+                                                ),
+                                                rx.text(f'{client["id"]} - {client["name"]}', color="var(--text-primary)"),
+                                                width="100%",
+                                                align="center",
+                                                spacing="3",
+                                            ),
+                                            on_click=State.toggle_new_tenant_assigned_client(client["id"]),
+                                            variant="ghost",
+                                            border=rx.cond(
+                                                State.new_tenant_assigned_client_ids.contains(client["id"]),
+                                                "1px solid rgba(255,122,47,0.38)",
+                                                "1px solid var(--input-border)",
+                                            ),
+                                            bg=rx.cond(
+                                                State.new_tenant_assigned_client_ids.contains(client["id"]),
+                                                "rgba(255,122,47,0.10)",
+                                                "transparent",
+                                            ),
+                                            width="100%",
+                                            justify_content="flex-start",
+                                        ),
+                                    ),
+                                    rx.fragment(),
+                                ),
+                                spacing="2",
+                                width="100%",
+                                align="stretch",
+                            ),
                             width="100%",
                         ),
+                        "Se selecionar um cliente pai, o tenant herda automaticamente o acesso aos clientes descendentes cadastrados no grupo. O workspace default da SmartLab permanece irrestrito.",
                     ),
                     columns="2",
                     spacing="3",
@@ -138,7 +204,7 @@ def build_tenants_view(State, CARD_STYLE: dict[str, Any], field_block, table_tex
                         )
                         for header in tenant_table_headers
                     ],
-                    columns="7",
+                    columns="8",
                     width="100%",
                     align_items="center",
                     justify_items="center",
@@ -159,7 +225,7 @@ def build_tenants_view(State, CARD_STYLE: dict[str, Any], field_block, table_tex
                             State.tenants_data,
                             lambda t: rx.grid(
                                 tenant_table_cell(
-                                    rx.text(t["owner_client_id"], color="var(--text-primary)", font_weight="600", font_size="0.86rem"),
+                                    rx.text(t["id"], color="var(--text-primary)", font_weight="600", font_size="0.86rem"),
                                 ),
                                 tenant_table_cell(
                                     rx.text(t["name"], color="var(--text-primary)", font_weight="600", font_size="0.84rem"),
@@ -179,6 +245,22 @@ def build_tenants_view(State, CARD_STYLE: dict[str, Any], field_block, table_tex
                                     rx.text(t["owner_client_name"], color="var(--text-secondary)", font_size="0.82rem"),
                                     rx.text(
                                         rx.cond(t["owner_client_name"] == "SmartLab", "Workspace interno", "Workspace do cliente"),
+                                        color="var(--text-muted)",
+                                        font_size="0.76rem",
+                                    ),
+                                ),
+                                tenant_table_cell(
+                                    rx.text(
+                                        rx.cond(
+                                            t["id"] == "default",
+                                            "SmartLab default: total",
+                                            f"Clientes no escopo: {t['client_scope_count']}",
+                                        ),
+                                        color="var(--text-secondary)",
+                                        font_size="0.82rem",
+                                    ),
+                                    rx.text(
+                                        t["client_scope_summary"],
                                         color="var(--text-muted)",
                                         font_size="0.76rem",
                                     ),
@@ -221,7 +303,7 @@ def build_tenants_view(State, CARD_STYLE: dict[str, Any], field_block, table_tex
                                         width="100%",
                                     ),
                                 ),
-                                columns="7",
+                                columns="8",
                                 width="100%",
                                 align_items="center",
                                 justify_items="center",

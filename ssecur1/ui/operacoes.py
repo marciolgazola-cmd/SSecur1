@@ -64,6 +64,200 @@ def build_apis_view(State, CARD_STYLE: dict[str, Any], data_table) -> rx.Compone
     )
 
 
+def build_auditoria_view(State, CARD_STYLE: dict[str, Any]) -> rx.Component:
+    return rx.vstack(
+        rx.box(
+            rx.vstack(
+                rx.hstack(
+                    rx.vstack(
+                        rx.heading("Auditoria", color="var(--text-primary)", size="5"),
+                        rx.text(
+                            "Trilha operacional local do sistema. Os eventos ficam gravados em arquivo para consulta e conferência.",
+                            color="var(--text-muted)",
+                        ),
+                        align="start",
+                        spacing="1",
+                    ),
+                    rx.spacer(),
+                    rx.badge("SmartLab interno", color_scheme="purple"),
+                    width="100%",
+                    align="center",
+                ),
+                rx.text(f"Arquivo de log: {State.audit_log_path_display}", color="var(--text-secondary)", font_size="0.84rem"),
+                rx.grid(
+                    rx.select(
+                        State.audit_scope_options,
+                        value=State.audit_filter_scope,
+                        on_change=State.set_audit_filter_scope,
+                        width="100%",
+                    ),
+                    rx.select(
+                        State.audit_event_options,
+                        value=State.audit_filter_event,
+                        on_change=State.set_audit_filter_event,
+                        width="100%",
+                    ),
+                    rx.select(
+                        State.audit_tenant_options,
+                        value=State.audit_filter_tenant,
+                        on_change=State.set_audit_filter_tenant,
+                        width="100%",
+                    ),
+                    rx.select(
+                        State.audit_user_options,
+                        value=State.audit_filter_user,
+                        on_change=State.set_audit_filter_user,
+                        width="100%",
+                    ),
+                    columns="4",
+                    spacing="3",
+                    width="100%",
+                ),
+                rx.grid(
+                    rx.foreach(
+                        State.audit_theme_summary,
+                        lambda item: rx.box(
+                            rx.vstack(
+                                rx.text(item["label"], color="var(--text-muted)", font_size="0.8rem"),
+                                rx.heading(item["count"], color="var(--text-primary)", size="5"),
+                                rx.text("evento(s) no filtro atual", color="var(--text-secondary)", font_size="0.8rem"),
+                                align="start",
+                                spacing="1",
+                                width="100%",
+                            ),
+                            padding="0.9rem",
+                            class_name="panel-card metric-card",
+                            **CARD_STYLE,
+                        ),
+                    ),
+                    columns="4",
+                    spacing="3",
+                    width="100%",
+                ),
+                width="100%",
+                spacing="3",
+                align="start",
+            ),
+            width="100%",
+            padding="1rem",
+            **CARD_STYLE,
+        ),
+        rx.box(
+            rx.vstack(
+                rx.hstack(
+                    rx.heading("Eventos filtrados", color="var(--text-primary)", size="4"),
+                    rx.spacer(),
+                    rx.badge(f"{State.audit_filtered_events_data.length()} item(ns)", color_scheme="orange"),
+                    width="100%",
+                    align="center",
+                ),
+                rx.foreach(
+                    State.audit_filtered_events_data,
+                    lambda item: rx.box(
+                        rx.vstack(
+                            rx.hstack(
+                                rx.badge(item["scope"], color_scheme="orange"),
+                                rx.text(item["timestamp"], color="var(--text-muted)", font_size="0.78rem"),
+                                rx.spacer(),
+                                rx.cond(
+                                    item["answer_mode_label"] != "",
+                                    rx.badge(item["answer_mode_label"], color_scheme="purple"),
+                                    rx.fragment(),
+                                ),
+                                rx.text(item["tenant"], color="var(--text-secondary)", font_size="0.8rem"),
+                                rx.button(
+                                    rx.cond(
+                                        State.audit_expanded_event_ids.contains(item["audit_id"]),
+                                        "Ocultar",
+                                        "Mostrar",
+                                    ),
+                                    on_click=State.toggle_audit_event_expanded(item["audit_id"]),
+                                    size="1",
+                                    variant="ghost",
+                                    border="1px solid var(--input-border)",
+                                    color="var(--text-secondary)",
+                                ),
+                                width="100%",
+                                align="center",
+                            ),
+                            rx.text(item["event_label"], color="var(--text-primary)", font_weight="700"),
+                            rx.cond(
+                                State.audit_expanded_event_ids.contains(item["audit_id"]),
+                                rx.vstack(
+                                    rx.text(item["detail"], color="var(--text-secondary)", font_size="0.86rem"),
+                                    rx.cond(
+                                        item["question"] != "",
+                                        rx.box(
+                                            rx.vstack(
+                                                rx.text("Pergunta", color="var(--text-muted)", font_size="0.76rem", font_weight="600"),
+                                                rx.text(item["question"], color="var(--text-primary)", font_size="0.84rem"),
+                                                rx.text("Resposta", color="var(--text-muted)", font_size="0.76rem", font_weight="600"),
+                                                rx.text(item["answer"], color="var(--text-secondary)", white_space="pre-wrap", font_size="0.84rem"),
+                                                rx.text(
+                                                    f"Modo: {item['answer_mode_label']} | Modelo: {item['model']} | Escopo: {item['assistant_scope']}",
+                                                    color="var(--text-muted)",
+                                                    font_size="0.76rem",
+                                                ),
+                                                rx.cond(
+                                                    item["sources"] != "",
+                                                    rx.text(
+                                                        f"Fontes usadas: {item['sources']}",
+                                                        color="var(--text-muted)",
+                                                        font_size="0.76rem",
+                                                        white_space="pre-wrap",
+                                                    ),
+                                                    rx.fragment(),
+                                                ),
+                                                align="start",
+                                                spacing="1",
+                                                width="100%",
+                                            ),
+                                            width="100%",
+                                            padding="0.75rem",
+                                            border="1px solid var(--input-border)",
+                                            border_radius="12px",
+                                            bg="var(--surface-soft)",
+                                        ),
+                                        rx.fragment(),
+                                    ),
+                                    rx.text(
+                                        f"Usuário: {item['user']} | Visão: {item['view']}",
+                                        color="var(--text-muted)",
+                                        font_size="0.78rem",
+                                    ),
+                                    align="start",
+                                    spacing="1",
+                                    width="100%",
+                                ),
+                                rx.text(
+                                    item["detail"],
+                                    color="var(--text-secondary)",
+                                    font_size="0.86rem",
+                                ),
+                            ),
+                            align="start",
+                            spacing="1",
+                            width="100%",
+                        ),
+                        width="100%",
+                        padding="0.9rem",
+                        class_name="panel-card data-table-card",
+                        **CARD_STYLE,
+                    ),
+                ),
+                width="100%",
+                spacing="3",
+                align="start",
+            ),
+            width="100%",
+            padding="1rem",
+            **CARD_STYLE,
+        ),
+        width="100%",
+        spacing="4",
+    )
+
+
 def build_dashboard_view(State, CARD_STYLE: dict[str, Any], metric_card, data_table) -> rx.Component:
     return rx.vstack(
         rx.box(
@@ -233,6 +427,10 @@ def build_planos_view(State, CARD_STYLE: dict[str, Any]) -> rx.Component:
         return rx.box(
             rx.vstack(
                 rx.text(action["title"], color="var(--text-primary)", font_weight="600"),
+                rx.text(f"Serviço: {action['service_name']}", color="var(--text-secondary)", font_size="0.83rem"),
+                rx.text(f"Cliente: {action['client_name']}", color="var(--text-secondary)", font_size="0.83rem"),
+                rx.text(f"Dimensões: {action['dimensions']}", color="var(--text-secondary)", font_size="0.83rem"),
+                rx.text(f"Área alvo: {action['target_area']}", color="var(--text-secondary)", font_size="0.83rem"),
                 rx.text(f"Responsável: {action['owner']}", color="var(--text-secondary)", font_size="0.85rem"),
                 rx.text(
                     rx.cond(action["due_date"] != "", f"Prazo: {action['due_date']}", "Prazo: -"),
@@ -308,6 +506,7 @@ def build_planos_view(State, CARD_STYLE: dict[str, Any]) -> rx.Component:
                     color="var(--text-primary)",
                     width="100%",
                 ),
+                rx.text(State.selected_project_plan_context, color="var(--text-muted)", font_size="0.82rem"),
                 rx.hstack(
                     rx.input(
                         placeholder="Ação",
@@ -329,6 +528,27 @@ def build_planos_view(State, CARD_STYLE: dict[str, Any]) -> rx.Component:
                         on_change=State.set_new_action_due_date,
                         bg="var(--input-bg)",
                         color="var(--text-primary)",
+                    ),
+                    width="100%",
+                    spacing="3",
+                    flex_wrap="wrap",
+                ),
+                rx.hstack(
+                    rx.input(
+                        placeholder="Dimensões impactadas (ex: Presença, Comunicação)",
+                        value=State.new_action_dimensions,
+                        on_change=State.set_new_action_dimensions,
+                        bg="var(--input-bg)",
+                        color="var(--text-primary)",
+                        width="100%",
+                    ),
+                    rx.input(
+                        placeholder="Área responsável/alvo",
+                        value=State.new_action_area,
+                        on_change=State.set_new_action_area,
+                        bg="var(--input-bg)",
+                        color="var(--text-primary)",
+                        width="100%",
                     ),
                     width="100%",
                     spacing="3",

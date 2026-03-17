@@ -7,7 +7,7 @@ a = Analysis(
     ['app.py'],
     pathex=[],
     binaries=[],
-    datas=[('styles.css', '.')],
+    datas=[('assets', 'assets')],
     hiddenimports=['reflex', 'sqlalchemy', 'alembic'],
     hookspath=[],
     hooksconfig={},
