@@ -43,6 +43,9 @@ class SessionStateMixin(rx.State):
     pending_delete_kind: str = ""
     pending_delete_target_id: str = ""
     pending_delete_label: str = ""
+    ai_recommendation_items: list[dict[str, str]] = []
+    ai_recommendation_editing_id: str = ""
+    ai_recommendation_sending_id: str = ""
 
     @rx.var
     def theme_class(self) -> str:
@@ -116,6 +119,12 @@ class SessionStateMixin(rx.State):
         self.pending_delete_label = label.strip() or "este registro"
         self.delete_confirm_open = True
 
+    def request_password_reset_confirmation(self, label: str = ""):
+        self.pending_delete_kind = "reset_password"
+        self.pending_delete_target_id = ""
+        self.pending_delete_label = label.strip() or "o usuario selecionado"
+        self.delete_confirm_open = True
+
     def cancel_delete_confirmation(self):
         self.delete_confirm_open = False
         self.pending_delete_kind = ""
@@ -125,6 +134,15 @@ class SessionStateMixin(rx.State):
     def confirm_delete_action(self):
         kind = (self.pending_delete_kind or "").strip().lower()
         raw_target = self.pending_delete_target_id
+        if kind == "reset_password":
+            self.cancel_delete_confirmation()
+            handler = getattr(self, "reset_selected_user_password", None)
+            if not callable(handler):
+                self.toast_message = "Ação de reset de senha não encontrada"
+                self.toast_type = "error"
+                return
+            handler()
+            return
         if kind == "project":
             self.cancel_delete_confirmation()
             if not str(raw_target).isdigit():
@@ -141,6 +159,22 @@ class SessionStateMixin(rx.State):
                 return
             self.delete_interview_from_modal(str(raw_target))
             return
+        if kind == "ai_recommendation":
+            self.cancel_delete_confirmation()
+            handler = getattr(self, "delete_ai_recommendation", None)
+            if callable(handler):
+                handler(str(raw_target))
+                return
+            current_items = list(getattr(self, "ai_recommendation_items", []))
+            updated_items = [item for item in current_items if str(item.get("id")) != str(raw_target)]
+            setattr(self, "ai_recommendation_items", updated_items)
+            if getattr(self, "ai_recommendation_editing_id", "") == str(raw_target):
+                setattr(self, "ai_recommendation_editing_id", "")
+            if getattr(self, "ai_recommendation_sending_id", "") == str(raw_target):
+                setattr(self, "ai_recommendation_sending_id", "")
+            self.toast_message = "Recomendação removida da fila"
+            self.toast_type = "success"
+            return
         method_map = {
             "question": "delete_question",
             "user": "delete_user",
@@ -149,6 +183,7 @@ class SessionStateMixin(rx.State):
             "role": "delete_role",
             "responsibility": "delete_responsibility",
             "form": "delete_form",
+            "action_plan": "delete_action_plan",
             "workflow_box": "delete_workflow_box",
             "permission_box": "delete_permission_box",
         }
@@ -159,7 +194,7 @@ class SessionStateMixin(rx.State):
             self.toast_message = "Ação de exclusão não encontrada"
             self.toast_type = "error"
             return
-        int_kinds = {"question", "user", "client", "project", "role", "responsibility", "form", "workflow_box", "permission_box"}
+        int_kinds = {"question", "user", "client", "project", "role", "responsibility", "form", "action_plan", "workflow_box", "permission_box"}
         target = raw_target
         if kind in int_kinds:
             if not str(raw_target).isdigit():
@@ -324,6 +359,8 @@ class SessionStateMixin(rx.State):
         self.home_tenant_id = user.tenant_id
         self.current_tenant = user.tenant_id
         self.hydrate_tenant_context()
+        if self.user_role == "sem_acesso":
+            self.active_view = "dashboard"
         self.force_password_reset_required = int(user.must_change_password or 0) == 1
         if self.force_password_reset_required:
             self.auth_open = True
@@ -333,7 +370,11 @@ class SessionStateMixin(rx.State):
             self.toast_type = "success"
         else:
             self.auth_open = False
-            self.toast_message = "Login realizado com sucesso"
+            self.toast_message = (
+                "Conta criada com sucesso, mas ainda sem acessos liberados. Aguarde a liberação na UI Permissões."
+                if self.user_role == "sem_acesso"
+                else "Login realizado com sucesso"
+            )
             self.toast_type = "success"
         audit_logger = getattr(self, "_append_audit_entry", None)
         if callable(audit_logger):
@@ -384,7 +425,7 @@ class SessionStateMixin(rx.State):
                 name=self.register_name,
                 email=self.register_email.strip().lower(),
                 password=self.register_password,
-                role="viewer",
+                role="sem_acesso",
                 tenant_id=self.current_tenant,
             )
         )

@@ -36,12 +36,28 @@ def build_delete_confirm_modal(State, CARD_STYLE: dict[str, Any]) -> rx.Componen
         rx.box(
             rx.box(
                 rx.vstack(
-                    rx.heading("Realmente deseja excluir?", color="var(--text-primary)", size="5"),
+                    rx.heading(
+                        rx.cond(
+                            State.pending_delete_kind == "reset_password",
+                            "Confirmar Reset de Senha",
+                            "Realmente deseja excluir?",
+                        ),
+                        color="var(--text-primary)",
+                        size="5",
+                    ),
                     rx.text(
                         rx.cond(
-                            State.pending_delete_label != "",
-                            f"Confirme a exclusão de: {State.pending_delete_label}",
-                            "Confirme a exclusão do registro selecionado.",
+                            State.pending_delete_kind == "reset_password",
+                            rx.cond(
+                                State.pending_delete_label != "",
+                                f"Confirme o reset de senha para: {State.pending_delete_label}",
+                                "Confirme o reset de senha do usuario selecionado.",
+                            ),
+                            rx.cond(
+                                State.pending_delete_label != "",
+                                f"Confirme a exclusão de: {State.pending_delete_label}",
+                                "Confirme a exclusão do registro selecionado.",
+                            ),
                         ),
                         color="var(--text-secondary)",
                         text_align="center",

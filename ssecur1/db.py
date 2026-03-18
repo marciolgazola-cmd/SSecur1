@@ -211,11 +211,33 @@ class ActionPlanModel(Base):
     target_area = Column(String, default="")
     title = Column(String, nullable=False)
     owner = Column(String, nullable=False)
+    start_date = Column(String, default="")
+    planned_due_date = Column(String, default="")
     due_date = Column(String, default="")
+    due_date_change_count = Column(Integer, default=0)
     status = Column(String, default="a_fazer")
     expected_result = Column(Text, default="")
     actual_result = Column(Text, default="")
     attainment = Column(Integer, default=0)
+    task_items_json = Column(Text, default="[]")
+    completed_at = Column(String, default="")
+
+
+class ActionTaskModel(Base):
+    __tablename__ = "action_tasks"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False)
+    action_plan_id = Column(Integer, ForeignKey("action_plans.id"), nullable=False)
+    title = Column(String, nullable=False)
+    owner = Column(String, nullable=False)
+    start_date = Column(String, default="")
+    planned_due_date = Column(String, default="")
+    due_date = Column(String, default="")
+    due_date_change_count = Column(Integer, default=0)
+    expected_result = Column(Text, default="")
+    progress = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 class AssistantDocumentModel(Base):
@@ -245,6 +267,21 @@ class AssistantChunkModel(Base):
     content = Column(Text, nullable=False)
     keyword_blob = Column(Text, default="")
     embedding_json = Column(Text, default="[]")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class AssistantRecommendationModel(Base):
+    __tablename__ = "assistant_recommendations"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
+    title = Column(String, nullable=False)
+    owner = Column(String, default="")
+    due_date = Column(String, default="")
+    expected_result = Column(Text, default="")
+    status = Column(String, default="open")
+    created_by = Column(String, default="sistema")
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -365,6 +402,14 @@ def ensure_schema_updates() -> None:
         _safe_add_column(conn, "action_plans", "service_name", "ALTER TABLE action_plans ADD COLUMN service_name VARCHAR DEFAULT '';")
         _safe_add_column(conn, "action_plans", "dimension_names", "ALTER TABLE action_plans ADD COLUMN dimension_names TEXT DEFAULT '';")
         _safe_add_column(conn, "action_plans", "target_area", "ALTER TABLE action_plans ADD COLUMN target_area VARCHAR DEFAULT '';")
+        _safe_add_column(conn, "action_plans", "start_date", "ALTER TABLE action_plans ADD COLUMN start_date VARCHAR DEFAULT '';")
+        _safe_add_column(conn, "action_plans", "planned_due_date", "ALTER TABLE action_plans ADD COLUMN planned_due_date VARCHAR DEFAULT '';")
+        _safe_add_column(conn, "action_plans", "due_date_change_count", "ALTER TABLE action_plans ADD COLUMN due_date_change_count INTEGER DEFAULT 0;")
+        _safe_add_column(conn, "action_plans", "task_items_json", "ALTER TABLE action_plans ADD COLUMN task_items_json TEXT DEFAULT '[]';")
+        _safe_add_column(conn, "action_plans", "completed_at", "ALTER TABLE action_plans ADD COLUMN completed_at VARCHAR DEFAULT '';")
+        _safe_add_column(conn, "action_tasks", "planned_due_date", "ALTER TABLE action_tasks ADD COLUMN planned_due_date VARCHAR DEFAULT '';")
+        _safe_add_column(conn, "action_tasks", "due_date_change_count", "ALTER TABLE action_tasks ADD COLUMN due_date_change_count INTEGER DEFAULT 0;")
+        _safe_add_column(conn, "action_tasks", "expected_result", "ALTER TABLE action_tasks ADD COLUMN expected_result TEXT DEFAULT '';")
         _safe_add_column(conn, "assistant_documents", "knowledge_scope", "ALTER TABLE assistant_documents ADD COLUMN knowledge_scope VARCHAR DEFAULT 'tenant';")
         conn.exec_driver_sql("UPDATE assistant_documents SET knowledge_scope = 'tenant' WHERE knowledge_scope IS NULL;")
 

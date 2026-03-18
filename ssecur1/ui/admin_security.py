@@ -32,11 +32,6 @@ def build_tenants_view(State, CARD_STYLE: dict[str, Any], field_block, table_tex
                 rx.hstack(
                     rx.vstack(
                         rx.heading("Tenants", color="var(--text-primary)", size="5"),
-                        rx.text(
-                            "Cada workspace opera com contexto próprio. Documentos, respostas e análises do Especialista IA devem permanecer isolados por tenant.",
-                            color="var(--text-muted)",
-                            font_size="0.88rem",
-                        ),
                         align="start",
                         spacing="1",
                     ),
@@ -60,7 +55,7 @@ def build_tenants_view(State, CARD_STYLE: dict[str, Any], field_block, table_tex
                     field_block(
                         "Slug do workspace",
                         rx.input(
-                            placeholder="ex: 4zoom, smartlab-interno",
+                            placeholder="ex: 4zoom, default",
                             value=State.new_tenant_slug,
                             on_change=State.set_new_tenant_slug,
                             bg="var(--input-bg)",
@@ -163,24 +158,36 @@ def build_tenants_view(State, CARD_STYLE: dict[str, Any], field_block, table_tex
                             rx.button(
                                 State.tenant_submit_label,
                                 on_click=State.create_tenant,
-                                bg="rgba(255,122,47,0.18)",
-                                color="#fdba74",
-                                border="1px solid rgba(255,122,47,0.38)",
+                                class_name="primary-soft-action",
                             ),
                             rx.cond(
                                 State.is_editing_tenant,
                                 rx.button(
                                     "Cancelar",
                                     on_click=State.reset_tenant_form,
-                                    variant="ghost",
-                                    border="1px solid var(--input-border)",
-                                    color="var(--text-secondary)",
+                                    min_height="40px",
+                                    padding="0 1rem",
+                                    bg="rgba(250,204,21,0.12)",
+                                    color="#fef08a",
+                                    border="1px solid rgba(250,204,21,0.28)",
+                                    border_radius="12px",
+                                    font_weight="500",
+                                    box_shadow="none",
                                 ),
                                 rx.fragment(),
                             ),
                         ),
                         rx.badge("Sem permissao para editar tenants", color_scheme="red"),
                     ),
+                    width="100%",
+                ),
+                rx.box(
+                    rx.text(
+                        "Cada workspace opera com contexto próprio. Documentos, respostas e análises do Especialista IA devem permanecer isolados por tenant.",
+                        color="var(--text-muted)",
+                        font_size="0.84rem",
+                    ),
+                    class_name="workspace-guide",
                     width="100%",
                 ),
                 width="100%",
@@ -228,79 +235,233 @@ def build_tenants_view(State, CARD_STYLE: dict[str, Any], field_block, table_tex
                                     rx.text(t["id"], color="var(--text-primary)", font_weight="600", font_size="0.86rem"),
                                 ),
                                 tenant_table_cell(
-                                    rx.text(t["name"], color="var(--text-primary)", font_weight="600", font_size="0.84rem"),
-                                ),
-                                tenant_table_cell(
-                                    rx.text(t["slug"], color="var(--text-secondary)", font_size="0.82rem"),
-                                    rx.button(
-                                        "Copiar slug",
-                                        on_click=rx.set_clipboard(t["slug"]),
-                                        variant="ghost",
-                                        border="1px solid var(--input-border)",
-                                        color="var(--text-secondary)",
-                                        size="1",
-                                    ),
-                                ),
-                                tenant_table_cell(
-                                    rx.text(t["owner_client_name"], color="var(--text-secondary)", font_size="0.82rem"),
-                                    rx.text(
-                                        rx.cond(t["owner_client_name"] == "SmartLab", "Workspace interno", "Workspace do cliente"),
-                                        color="var(--text-muted)",
-                                        font_size="0.76rem",
-                                    ),
-                                ),
-                                tenant_table_cell(
-                                    rx.text(
-                                        rx.cond(
-                                            t["id"] == "default",
-                                            "SmartLab default: total",
-                                            f"Clientes no escopo: {t['client_scope_count']}",
+                                    rx.cond(
+                                        State.editing_tenant_id == t["id"],
+                                        rx.input(
+                                            value=State.new_tenant_name,
+                                            on_change=State.set_new_tenant_name,
+                                            bg="var(--input-bg)",
+                                            color="var(--text-primary)",
+                                            width="100%",
                                         ),
-                                        color="var(--text-secondary)",
-                                        font_size="0.82rem",
+                                        rx.text(t["name"], color="var(--text-primary)", font_weight="600", font_size="0.84rem"),
                                     ),
-                                    rx.text(
-                                        t["client_scope_summary"],
-                                        color="var(--text-muted)",
-                                        font_size="0.76rem",
+                                ),
+                                tenant_table_cell(
+                                    rx.cond(
+                                        State.editing_tenant_id == t["id"],
+                                        rx.input(
+                                            value=State.new_tenant_slug,
+                                            on_change=State.set_new_tenant_slug,
+                                            bg="var(--input-bg)",
+                                            color="var(--text-primary)",
+                                            width="100%",
+                                        ),
+                                        rx.fragment(
+                                            rx.text(t["slug"], color="var(--text-secondary)", font_size="0.82rem"),
+                                            rx.button(
+                                                "Copiar slug",
+                                                on_click=rx.set_clipboard(t["slug"]),
+                                                variant="ghost",
+                                                border="1px solid var(--input-border)",
+                                                color="var(--text-secondary)",
+                                                size="1",
+                                            ),
+                                        ),
+                                    ),
+                                ),
+                                tenant_table_cell(
+                                    rx.cond(
+                                        State.editing_tenant_id == t["id"],
+                                        rx.vstack(
+                                            rx.text(
+                                                State.selected_tenant_assigned_clients_summary,
+                                                color="var(--text-primary)",
+                                                font_size="0.8rem",
+                                                white_space="normal",
+                                                word_break="break-word",
+                                            ),
+                                            rx.text(
+                                                "O primeiro cliente selecionado define o proprietário do workspace.",
+                                                color="var(--text-muted)",
+                                                font_size="0.74rem",
+                                                white_space="normal",
+                                                word_break="break-word",
+                                            ),
+                                            spacing="1",
+                                            width="100%",
+                                            align="center",
+                                        ),
+                                        rx.fragment(
+                                            rx.text(t["owner_client_name"], color="var(--text-secondary)", font_size="0.82rem"),
+                                            rx.text(
+                                                rx.cond(t["id"] == "default", "Workspace default", "Workspace do cliente"),
+                                                color="var(--text-muted)",
+                                                font_size="0.76rem",
+                                            ),
+                                        ),
+                                    ),
+                                ),
+                                tenant_table_cell(
+                                    rx.cond(
+                                        State.editing_tenant_id == t["id"],
+                                        rx.box(
+                                            rx.vstack(
+                                                rx.button(
+                                                    rx.hstack(
+                                                        rx.text(State.selected_tenant_assigned_clients_summary, color="var(--text-primary)"),
+                                                        rx.spacer(),
+                                                        rx.icon(
+                                                            tag=rx.cond(State.new_tenant_assigned_clients_open, "chevron_up", "chevron_down"),
+                                                            size=16,
+                                                            color="var(--text-muted)",
+                                                        ),
+                                                        width="100%",
+                                                        align="center",
+                                                    ),
+                                                    on_click=State.toggle_new_tenant_assigned_clients_open,
+                                                    variant="ghost",
+                                                    border="1px solid var(--input-border)",
+                                                    bg="var(--input-bg)",
+                                                    width="100%",
+                                                    justify_content="flex-start",
+                                                ),
+                                                rx.cond(
+                                                    State.new_tenant_assigned_clients_open,
+                                                    rx.foreach(
+                                                        State.assignable_client_options,
+                                                        lambda client: rx.button(
+                                                            rx.hstack(
+                                                                rx.badge(
+                                                                    rx.cond(
+                                                                        State.new_tenant_assigned_client_ids.contains(client["id"]),
+                                                                        "No escopo",
+                                                                        "Disponível",
+                                                                    ),
+                                                                    color_scheme=rx.cond(
+                                                                        State.new_tenant_assigned_client_ids.contains(client["id"]),
+                                                                        "orange",
+                                                                        "gray",
+                                                                    ),
+                                                                ),
+                                                                rx.text(f'{client["id"]} - {client["name"]}', color="var(--text-primary)"),
+                                                                width="100%",
+                                                                align="center",
+                                                                spacing="3",
+                                                            ),
+                                                            on_click=State.toggle_new_tenant_assigned_client(client["id"]),
+                                                            variant="ghost",
+                                                            border=rx.cond(
+                                                                State.new_tenant_assigned_client_ids.contains(client["id"]),
+                                                                "1px solid rgba(255,122,47,0.38)",
+                                                                "1px solid var(--input-border)",
+                                                            ),
+                                                            bg=rx.cond(
+                                                                State.new_tenant_assigned_client_ids.contains(client["id"]),
+                                                                "rgba(255,122,47,0.10)",
+                                                                "transparent",
+                                                            ),
+                                                            width="100%",
+                                                            justify_content="flex-start",
+                                                        ),
+                                                    ),
+                                                    rx.fragment(),
+                                                ),
+                                                spacing="2",
+                                                width="100%",
+                                                align="stretch",
+                                            ),
+                                            width="100%",
+                                        ),
+                                        rx.fragment(
+                                            rx.text(
+                                                rx.cond(
+                                                    t["id"] == "default",
+                                                    "default: total",
+                                                    f"Clientes no escopo: {t['client_scope_count']}",
+                                                ),
+                                                color="var(--text-secondary)",
+                                                font_size="0.82rem",
+                                            ),
+                                            rx.text(
+                                                t["client_scope_summary"],
+                                                color="var(--text-muted)",
+                                                font_size="0.76rem",
+                                            ),
+                                        ),
                                     ),
                                 ),
                                 tenant_table_cell(
                                     rx.text(t["created_at"], color="var(--text-secondary)", font_size="0.82rem"),
                                 ),
                                 tenant_table_cell(
-                                    rx.text(t["limit"], color="var(--text-secondary)", font_size="0.82rem"),
+                                    rx.cond(
+                                        State.editing_tenant_id == t["id"],
+                                        rx.input(
+                                            value=State.new_tenant_limit,
+                                            on_change=State.set_new_tenant_limit,
+                                            bg="var(--input-bg)",
+                                            color="var(--text-primary)",
+                                            width="100%",
+                                        ),
+                                        rx.text(t["limit"], color="var(--text-secondary)", font_size="0.82rem"),
+                                    ),
                                 ),
                                 tenant_table_cell(
-                                    rx.hstack(
-                                        rx.cond(
-                                            State.can_manage_tenants,
+                                    rx.cond(
+                                        State.editing_tenant_id == t["id"],
+                                        rx.hstack(
                                             rx.button(
-                                                "Alterar",
-                                                on_click=State.start_edit_tenant(t["id"]),
-                                                bg="rgba(255,122,47,0.18)",
-                                                color="#fdba74",
-                                                border="1px solid rgba(255,122,47,0.38)",
+                                                "Salvar",
+                                                on_click=State.create_tenant,
+                                                bg="rgba(34,197,94,0.16)",
+                                                color="#86efac",
+                                                border="1px solid rgba(34,197,94,0.34)",
                                                 size="1",
                                             ),
-                                            rx.fragment(),
-                                        ),
-                                        rx.cond(
-                                            State.can_delete_tenants,
                                             rx.button(
-                                                "Excluir",
-                                                on_click=State.request_delete_confirmation("tenant", t["id"], t["name"]),
-                                                bg="rgba(239,68,68,0.2)",
-                                                color="#fca5a5",
-                                                border="1px solid rgba(239,68,68,0.4)",
+                                                "Cancelar",
+                                                on_click=State.reset_tenant_form,
+                                                bg="rgba(250,204,21,0.16)",
+                                                color="#fde68a",
+                                                border="1px solid rgba(250,204,21,0.34)",
                                                 size="1",
                                             ),
-                                            rx.text("-", color="#64748b", font_size="0.82rem"),
+                                            spacing="2",
+                                            align="center",
+                                            justify="center",
+                                            width="100%",
                                         ),
-                                        spacing="2",
-                                        align="center",
-                                        justify="center",
-                                        width="100%",
+                                        rx.hstack(
+                                            rx.cond(
+                                                State.can_manage_tenants,
+                                                rx.button(
+                                                    "Alterar",
+                                                    on_click=State.start_edit_tenant(t["id"]),
+                                                    bg="rgba(255,122,47,0.18)",
+                                                    color="#fdba74",
+                                                    border="1px solid rgba(255,122,47,0.38)",
+                                                    size="1",
+                                                ),
+                                                rx.fragment(),
+                                            ),
+                                            rx.cond(
+                                                State.can_delete_tenants,
+                                                rx.button(
+                                                    "Excluir",
+                                                    on_click=State.request_delete_confirmation("tenant", t["id"], t["name"]),
+                                                    bg="rgba(239,68,68,0.2)",
+                                                    color="#fca5a5",
+                                                    border="1px solid rgba(239,68,68,0.4)",
+                                                    size="1",
+                                                ),
+                                                rx.text("-", color="#64748b", font_size="0.82rem"),
+                                            ),
+                                            spacing="2",
+                                            align="center",
+                                            justify="center",
+                                            width="100%",
+                                        ),
                                     ),
                                 ),
                                 columns="8",

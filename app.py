@@ -7,7 +7,7 @@ import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
 import zipfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from hashlib import sha1
 from pathlib import Path
 from typing import Any
@@ -15,9 +15,11 @@ from typing import Any
 import reflex as rx
 from sqlalchemy import or_
 from ssecur1.db import (
+    ActionTaskModel,
     ActionPlanModel,
     AssistantChunkModel,
     AssistantDocumentModel,
+    AssistantRecommendationModel,
     ClientModel,
     CustomOptionModel,
     DashboardBoxModel,
@@ -42,8 +44,11 @@ from ssecur1.utils import (
     collect_descendant_client_ids as _collect_descendant_client_ids,
     dimension_maturity_label as _dimension_maturity_label,
     dom_token as _dom_token,
+    format_display_date as _format_display_date,
+    format_display_datetime as _format_display_datetime,
     format_brl_amount as _format_brl_amount,
     loads_json as _loads_json,
+    now_brasilia as _now_brasilia,
     parse_brl_amount as _parse_brl_amount,
     parse_int as _parse_int,
     question_payload as _question_payload,
@@ -51,44 +56,155 @@ from ssecur1.utils import (
 )
 
 
+SMARTLAB_ADMIN_PERMS = {
+    "create:users",
+    "edit:users",
+    "delete:users",
+    "reset_password:users",
+    "create:clientes",
+    "edit:clientes",
+    "delete:clientes",
+    "create:tenants",
+    "edit:tenants",
+    "delete:tenants",
+    "create:roles",
+    "edit:roles",
+    "delete:roles",
+    "create:responsabilidades",
+    "edit:responsabilidades",
+    "delete:responsabilidades",
+    "create:forms",
+    "edit:forms",
+    "delete:forms",
+}
+
+CLIENTE_ADMIN_PERMS = {
+    "create:users",
+    "edit:users",
+    "delete:users",
+    "reset_password:users",
+    "create:roles",
+    "edit:roles",
+    "delete:roles",
+    "create:responsabilidades",
+    "edit:responsabilidades",
+    "delete:responsabilidades",
+}
+
 ROLE_PERMS = {
-    "admin": {
-        "create:users",
-        "edit:users",
-        "delete:users",
-        "create:clientes",
-        "edit:clientes",
-        "delete:clientes",
-        "create:tenants",
-        "edit:tenants",
-        "delete:tenants",
-        "create:roles",
-        "edit:roles",
-        "delete:roles",
-        "create:responsabilidades",
-        "edit:responsabilidades",
-        "delete:responsabilidades",
-        "create:forms",
-        "edit:forms",
-        "delete:forms",
-    },
-    "editor": {
-        "create:users",
-        "edit:users",
-        "create:clientes",
-        "edit:clientes",
-        "delete:clientes",
-        "create:tenants",
-        "edit:tenants",
-        "create:roles",
-        "edit:roles",
-        "create:responsabilidades",
-        "edit:responsabilidades",
-        "create:forms",
-        "edit:forms",
-    },
+    "sem_acesso": set(),
+    "smartlab_admin": SMARTLAB_ADMIN_PERMS,
+    "smartlab_viewer": set(),
+    "cliente_admin": CLIENTE_ADMIN_PERMS,
+    "cliente_viewer": set(),
+    "admin": SMARTLAB_ADMIN_PERMS,
+    "editor": SMARTLAB_ADMIN_PERMS,
     "viewer": set(),
 }
+
+ROLE_TEMPLATE_OPTION_KEYS = [
+    "smartlab_admin",
+    "smartlab_viewer",
+    "cliente_admin",
+    "cliente_viewer",
+]
+
+ROLE_TEMPLATE_ALIASES = {
+    "admin": "smartlab_admin",
+    "editor": "smartlab_admin",
+    "viewer": "smartlab_viewer",
+}
+
+ROLE_PERMISSION_CATALOG = [
+    {"module": "Usuarios", "token": "create:users", "label": "Criar usuarios", "description": "Cadastrar novas contas no tenant."},
+    {"module": "Usuarios", "token": "edit:users", "label": "Editar usuarios", "description": "Alterar cadastro, escopo e dados funcionais do usuario."},
+    {"module": "Usuarios", "token": "delete:users", "label": "Excluir usuarios", "description": "Remover contas existentes do tenant."},
+    {"module": "Usuarios", "token": "reset_password:users", "label": "Resetar senha", "description": "Gerar senha temporaria e forcar troca no proximo acesso."},
+    {"module": "Clientes", "token": "create:clientes", "label": "Criar clientes", "description": "Cadastrar novos clientes e workspaces."},
+    {"module": "Clientes", "token": "edit:clientes", "label": "Editar clientes", "description": "Atualizar dados cadastrais, grupos e estrutura."},
+    {"module": "Clientes", "token": "delete:clientes", "label": "Excluir clientes", "description": "Remover clientes e seus vinculos."},
+    {"module": "Tenants", "token": "create:tenants", "label": "Criar tenants", "description": "Criar novos workspaces e escopos operacionais."},
+    {"module": "Tenants", "token": "edit:tenants", "label": "Editar tenants", "description": "Ajustar slug, limites e escopos de cliente."},
+    {"module": "Tenants", "token": "delete:tenants", "label": "Excluir tenants", "description": "Remover tenants existentes."},
+    {"module": "Papeis", "token": "create:roles", "label": "Criar papeis", "description": "Criar papeis customizados de acesso."},
+    {"module": "Papeis", "token": "edit:roles", "label": "Editar papeis", "description": "Manter o baseline de permissoes dos papeis."},
+    {"module": "Papeis", "token": "delete:roles", "label": "Excluir papeis", "description": "Remover papeis customizados."},
+    {"module": "Responsabilidades", "token": "create:responsabilidades", "label": "Criar responsabilidades", "description": "Definir governanca e atribuicoes por papel."},
+    {"module": "Responsabilidades", "token": "edit:responsabilidades", "label": "Editar responsabilidades", "description": "Ajustar aprovadores, revisores e operadores."},
+    {"module": "Responsabilidades", "token": "delete:responsabilidades", "label": "Excluir responsabilidades", "description": "Remover vinculos de governanca."},
+    {"module": "Formularios", "token": "create:forms", "label": "Criar formularios", "description": "Cadastrar novas pesquisas e formularios."},
+    {"module": "Formularios", "token": "edit:forms", "label": "Editar formularios", "description": "Atualizar estrutura, etapas e conteudo."},
+    {"module": "Formularios", "token": "delete:forms", "label": "Excluir formularios", "description": "Remover pesquisas e formularios."},
+]
+
+WORKFLOW_STAGE_LIBRARY = [
+    {
+        "key": "kickoff",
+        "title": "Kickoff e Alinhamento",
+        "box_type": "trigger",
+        "zone": "left",
+        "context": "Preparacao",
+        "objective": "Alinhar escopo, patrocinadores, cronograma e combinados de operacao do projeto.",
+        "owner": "Consultor SmartLab",
+        "trigger": "Projeto contratado e cliente confirmado",
+        "expected_output": "Kickoff validado e cronograma inicial aprovado",
+    },
+    {
+        "key": "planejamento",
+        "title": "Planejamento de Campo",
+        "box_type": "etapa",
+        "zone": "left",
+        "context": "Preparacao",
+        "objective": "Definir areas, publico, agenda de entrevistas, formularios e pontos de contato.",
+        "owner": "Coordenacao do Projeto",
+        "trigger": "Kickoff concluido",
+        "expected_output": "Plano de campo e agenda operacional publicados",
+    },
+    {
+        "key": "coleta",
+        "title": "Coleta em Campo",
+        "box_type": "coleta",
+        "zone": "center",
+        "context": "Execucao",
+        "objective": "Executar entrevistas, visitas, rodas e capturar evidencias do cliente.",
+        "owner": "Equipe de Campo",
+        "trigger": "Agenda liberada e participantes confirmados",
+        "expected_output": "Respostas, evidencias e apontamentos consolidados",
+    },
+    {
+        "key": "analise",
+        "title": "Analise e Diagnostico",
+        "box_type": "analise",
+        "zone": "center",
+        "context": "Execucao",
+        "objective": "Interpretar evidencias, maturidade e lacunas para gerar diagnostico preliminar.",
+        "owner": "Especialista SmartLab",
+        "trigger": "Coleta encerrada",
+        "expected_output": "Diagnostico preliminar e principais achados",
+    },
+    {
+        "key": "devolutiva",
+        "title": "Devolutiva Executiva",
+        "box_type": "relatorio",
+        "zone": "right",
+        "context": "Fechamento",
+        "objective": "Apresentar achados, priorizacoes e riscos para lideranca e patrocinadores.",
+        "owner": "Lider do Projeto",
+        "trigger": "Diagnostico consolidado",
+        "expected_output": "Devolutiva validada com direcionadores executivos",
+    },
+    {
+        "key": "plano_acao",
+        "title": "Plano de Acao e Follow-up",
+        "box_type": "relatorio",
+        "zone": "right",
+        "context": "Fechamento",
+        "objective": "Traduzir os achados em iniciativas, responsaveis, prazos e acompanhamento.",
+        "owner": "Cliente e SmartLab",
+        "trigger": "Devolutiva aprovada",
+        "expected_output": "Plano de acao ativo e rotina de follow-up definida",
+    },
+]
 
 
 API_RESOURCE_CATALOG = [
@@ -146,10 +262,52 @@ PERMISSION_RESOURCE_CATALOG = [
     },
     {
         "module": "Dashboard",
-        "resource": "Progresso do Projeto",
-        "label": "Progresso do Projeto",
-        "description": "Leitura do andamento, marcos e status do projeto do cliente.",
+        "resource": "Dashboard Operacional",
+        "label": "Dashboard Operacional",
+        "description": "Leitura de indicadores operacionais, widgets e tabelas do tenant.",
         "action": "read",
+    },
+    {
+        "module": "Clientes",
+        "resource": "Clientes",
+        "label": "Clientes",
+        "description": "Visualizar a base de clientes, dados cadastrais e estrutura de grupo.",
+        "action": "read",
+    },
+    {
+        "module": "Clientes",
+        "resource": "Gerenciar Clientes",
+        "label": "Gerenciar Clientes",
+        "description": "Criar, editar e excluir clientes e seus dados principais.",
+        "action": "admin",
+    },
+    {
+        "module": "Tenants",
+        "resource": "Tenants",
+        "label": "Tenants",
+        "description": "Visualizar workspaces, escopo de clientes e limites configurados.",
+        "action": "read",
+    },
+    {
+        "module": "Tenants",
+        "resource": "Gerenciar Tenants",
+        "label": "Gerenciar Tenants",
+        "description": "Criar, editar e excluir tenants e seus escopos operacionais.",
+        "action": "admin",
+    },
+    {
+        "module": "Usuarios",
+        "resource": "Usuarios",
+        "label": "Usuarios",
+        "description": "Visualizar contas, vínculos de cliente, tenant e perfil funcional.",
+        "action": "read",
+    },
+    {
+        "module": "Usuarios",
+        "resource": "Gerenciar Usuarios",
+        "label": "Gerenciar Usuarios",
+        "description": "Criar, editar, redefinir contexto e excluir usuários do escopo permitido.",
+        "action": "admin",
     },
     {
         "module": "Projetos",
@@ -157,6 +315,13 @@ PERMISSION_RESOURCE_CATALOG = [
         "label": "Projetos",
         "description": "Consulta do escopo, status e configuracoes do projeto.",
         "action": "read",
+    },
+    {
+        "module": "Projetos",
+        "resource": "Gerenciar Projetos",
+        "label": "Gerenciar Projetos",
+        "description": "Criar, editar e reorganizar projetos, vínculos e workflow.",
+        "action": "write",
     },
     {
         "module": "Planos",
@@ -190,24 +355,101 @@ PERMISSION_RESOURCE_CATALOG = [
         "module": "Formularios",
         "resource": "Formularios",
         "label": "Formularios",
-        "description": "Consulta dos instrumentos de pesquisa publicados.",
+        "description": "Consulta dos instrumentos de pesquisa, etapas e questões publicadas.",
         "action": "read",
     },
     {
         "module": "Formularios",
-        "resource": "Responder Formularios",
-        "label": "Responder Formularios",
-        "description": "Permite responder formularios associados ao tenant.",
+        "resource": "Gerenciar Formularios",
+        "label": "Gerenciar Formularios",
+        "description": "Criar, editar e excluir formulários, etapas e estrutura de perguntas.",
         "action": "write",
     },
     {
-        "module": "Usuarios",
-        "resource": "Usuarios do Cliente",
-        "label": "Usuarios do Cliente",
-        "description": "Administracao limitada dos usuarios vinculados ao cliente.",
+        "module": "Respostas",
+        "resource": "Entrevistas e Respostas",
+        "label": "Entrevistas e Respostas",
+        "description": "Visualizar sessões, contexto ativo, respostas e scores registrados.",
+        "action": "read",
+    },
+    {
+        "module": "Respostas",
+        "resource": "Operar Entrevistas e Respostas",
+        "label": "Operar Entrevistas e Respostas",
+        "description": "Criar entrevistas, registrar respostas, atualizar score e concluir sessões.",
+        "action": "write",
+    },
+    {
+        "module": "Permissoes",
+        "resource": "Template RBAC",
+        "label": "Template RBAC",
+        "description": "Visualizar templates base de papel, escopo e baseline de acesso.",
+        "action": "read",
+    },
+    {
+        "module": "Permissoes",
+        "resource": "Canvas de Permissoes",
+        "label": "Canvas de Permissoes",
+        "description": "Liberar ou bloquear módulos, recursos e ações por usuário.",
         "action": "admin",
     },
+    {
+        "module": "Permissoes",
+        "resource": "Papeis e Responsabilidades",
+        "label": "Papeis e Responsabilidades",
+        "description": "Criar papéis customizados, definir responsabilidades e manter governança de acesso.",
+        "action": "admin",
+    },
+    {
+        "module": "APIs",
+        "resource": "APIs e Integrações",
+        "label": "APIs e Integrações",
+        "description": "Visualizar e operar integrações, conectores e parâmetros técnicos do tenant.",
+        "action": "admin",
+    },
+    {
+        "module": "Auditoria",
+        "resource": "Auditoria",
+        "label": "Auditoria",
+        "description": "Consultar trilha de eventos, acessos, decisões e uso do sistema.",
+        "action": "read",
+    },
+    {
+        "module": "IA",
+        "resource": "Especialista IA",
+        "label": "Especialista IA",
+        "description": "Acessar o assistente, contexto RAG e exploração analítica do tenant.",
+        "action": "read",
+    },
+    {
+        "module": "IA",
+        "resource": "Operar Especialista IA",
+        "label": "Operar Especialista IA",
+        "description": "Gerenciar documentos, contexto e automações analíticas do Especialista IA.",
+        "action": "write",
+    },
 ]
+
+RESOURCE_PERMISSION_TOKENS = {
+    "Gerenciar Clientes": {"create:clientes", "edit:clientes", "delete:clientes"},
+    "Gerenciar Tenants": {"create:tenants", "edit:tenants", "delete:tenants"},
+    "Gerenciar Usuarios": {"create:users", "edit:users", "delete:users", "reset_password:users"},
+    "Gerenciar Projetos": {"create:forms", "edit:forms", "delete:forms"},
+    "Editar Plano de Acoes": {"create:forms", "edit:forms"},
+    "Gerenciar Formularios": {"create:forms", "edit:forms", "delete:forms"},
+    "Operar Entrevistas e Respostas": {"create:forms", "edit:forms"},
+    "Canvas de Permissoes": {"create:roles", "edit:roles", "delete:roles"},
+    "Papeis e Responsabilidades": {
+        "create:roles",
+        "edit:roles",
+        "delete:roles",
+        "create:responsabilidades",
+        "edit:responsabilidades",
+        "delete:responsabilidades",
+    },
+    "APIs e Integrações": set(),
+    "Operar Especialista IA": set(),
+}
 
 CATALOG_SCOPE_DEFAULT = "default"
 CATALOG_SCOPE_CURRENT = "current"
@@ -227,63 +469,47 @@ def _catalog_tenant_for_key(current_tenant: str, catalog_key: str) -> str:
     return current_tenant
 
 ROLE_TEMPLATE_CATALOG = {
-    "admin": {
-        "label": "Admin SmartLab",
+    "smartlab_admin": {
+        "label": "SmartLab Admin",
         "scope": "smartlab",
-        "description": "Controle total do tenant e das operacoes da consultoria.",
-        "permissions": [
-            "create:clientes",
-            "edit:clientes",
-            "delete:clientes",
-            "create:tenants",
-            "edit:tenants",
-            "delete:tenants",
-            "create:roles",
-            "edit:roles",
-            "delete:roles",
-            "create:responsabilidades",
-            "edit:responsabilidades",
-            "delete:responsabilidades",
-            "create:forms",
-            "edit:forms",
-            "delete:forms",
-        ],
+        "description": "Acesso operacional e administrativo total sobre clientes, tenants, usuários, permissões e formulários.",
+        "permissions": sorted(SMARTLAB_ADMIN_PERMS),
     },
-    "editor": {
-        "label": "Consultor SmartLab",
+    "smartlab_viewer": {
+        "label": "SmartLab Viewer",
         "scope": "smartlab",
-        "description": "Opera clientes, projetos, formularios e planos de acao.",
-        "permissions": [
-            "create:clientes",
-            "edit:clientes",
-            "delete:clientes",
-            "create:tenants",
-            "edit:tenants",
-            "create:roles",
-            "edit:roles",
-            "create:responsabilidades",
-            "edit:responsabilidades",
-            "create:forms",
-            "edit:forms",
-        ],
-    },
-    "viewer": {
-        "label": "Leitura Interna",
-        "scope": "smartlab",
-        "description": "Acesso somente leitura para acompanhamento interno.",
+        "description": "Acesso amplo de leitura ao ecossistema SmartLab, sem operações de criação, edição ou exclusão.",
         "permissions": [],
     },
     "cliente_admin": {
-        "label": "Administrador do Cliente",
+        "label": "Cliente Admin",
         "scope": "cliente",
-        "description": "Administra acessos internos e acompanha entregaveis liberados.",
-        "permissions": ["read:dashboard", "read:relatorios", "manage:usuarios_cliente"],
+        "description": "Administra usuários, papéis, responsabilidades e acessos do próprio tenant do cliente.",
+        "permissions": sorted(CLIENTE_ADMIN_PERMS),
     },
     "cliente_viewer": {
-        "label": "Leitura do Cliente",
+        "label": "Cliente Viewer",
         "scope": "cliente",
-        "description": "Consulta dashboards, relatorios e planos autorizados.",
-        "permissions": ["read:dashboard", "read:relatorios"],
+        "description": "Leitura total do próprio tenant do cliente, sem alterações operacionais ou administrativas.",
+        "permissions": [],
+    },
+    "admin": {
+        "label": "SmartLab Admin",
+        "scope": "smartlab",
+        "description": "Alias legado para SmartLab Admin.",
+        "permissions": sorted(SMARTLAB_ADMIN_PERMS),
+    },
+    "editor": {
+        "label": "SmartLab Admin",
+        "scope": "smartlab",
+        "description": "Alias legado para SmartLab Admin.",
+        "permissions": sorted(SMARTLAB_ADMIN_PERMS),
+    },
+    "viewer": {
+        "label": "SmartLab Viewer",
+        "scope": "smartlab",
+        "description": "Alias legado para SmartLab Viewer.",
+        "permissions": [],
     },
 }
 
@@ -558,6 +784,10 @@ class State(SessionStateMixin):
     ai_knowledge_scope: str = "tenant"
     ai_scope_mode: str = "tenant"
     ai_history: list[dict[str, str]] = []
+    ai_recommendation_items: list[dict[str, str]] = []
+    ai_recommendation_editing_id: str = ""
+    ai_recommendation_sending_id: str = ""
+    ai_recommendation_snapshot: list[dict[str, str]] = []
     audit_filter_scope: str = "Todos"
     audit_filter_event: str = "Todos"
     audit_filter_tenant: str = "Todos"
@@ -567,7 +797,7 @@ class State(SessionStateMixin):
     new_user_name: str = ""
     new_user_email: str = ""
     new_user_password: str = ""
-    new_user_role: str = "viewer"
+    new_user_role: str = "sem_acesso"
     new_user_scope: str = "smartlab"
     new_user_client_id: str = ""
     new_user_tenant_id: str = "default"
@@ -603,8 +833,15 @@ class State(SessionStateMixin):
     editing_tenant_id: str = ""
 
     new_role_name: str = ""
-    new_role_permissions: str = "create:clientes,edit:clientes"
+    new_role_permissions: str = ""
+    new_role_responsibilities: str = ""
+    role_permission_module_filter: str = "Todos"
+    role_permission_choice: str = "create:users"
+    last_reset_user_password: str = ""
+    permissions_tab: str = "governanca"
     editing_role_id: str = ""
+    editing_role_template_key: str = ""
+    editing_role_template_origin: str = ""
 
     new_resp_role_id: str = ""
     new_resp_desc: str = ""
@@ -672,19 +909,37 @@ class State(SessionStateMixin):
     new_box_zone: str = "center"
     new_box_condition: str = ""
     new_box_output_key: str = ""
+    new_box_owner: str = ""
+    new_box_objective: str = ""
+    new_box_trigger: str = ""
+    new_box_expected_output: str = ""
     new_sticky_note_text: str = ""
     workflow_logs: list[str] = []
 
     new_action_title: str = ""
     new_action_owner: str = ""
+    new_action_start_date: str = ""
+    new_action_planned_due_date: str = ""
     new_action_due_date: str = ""
     new_action_expected_result: str = ""
     new_action_dimensions: str = ""
     new_action_area: str = ""
+    new_action_dimension_ids: list[str] = []
+    selected_action_plan_id: str = ""
+    editing_action_plan_id: str = ""
+    new_action_task_title: str = ""
+    new_action_task_owner: str = ""
+    new_action_task_start_date: str = ""
+    new_action_task_planned_due_date: str = ""
+    new_action_task_due_date: str = ""
+    new_action_task_expected_result: str = ""
+    new_action_task_progress: str = "0"
+    draft_action_tasks: list[dict[str, str]] = []
+    expanded_action_plan_ids: list[str] = []
 
     perm_user_email: str = ""
     perm_selected_module: str = "Todos"
-    perm_selected_role_template: str = "cliente_admin"
+    perm_selected_role_template: str = "smartlab_admin"
 
     new_dashboard_box_title: str = ""
     new_dashboard_box_kind: str = "kpi"
@@ -696,7 +951,7 @@ class State(SessionStateMixin):
 
     def _append_audit_entry(self, event: str, detail: str, scope: str = "info", extra: dict[str, str] | None = None):
         entry = {
-            "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "timestamp": _format_display_datetime(_now_brasilia(), include_seconds=True),
             "event": event,
             "detail": detail,
             "scope": scope,
@@ -773,6 +1028,85 @@ class State(SessionStateMixin):
     def prepare_ai_view(self):
         self.ai_answer = ""
         self.dragged_question_text = ""
+        self.refresh_ai_recommendations()
+
+    def _is_default_knowledge_scope(self, value: str | None) -> bool:
+        return str(value or "").strip().lower() in {"default", "smartlab", "global"}
+
+    def _ai_knowledge_scope_db_value(self) -> str:
+        return "default" if self.ai_knowledge_scope_effective == "default" else "tenant"
+
+    def _default_knowledge_scope_filter(self):
+        return AssistantDocumentModel.knowledge_scope.in_(["default", "smartlab"])
+
+    def _ai_document_scope_label(self, knowledge_scope: str | None, project_id: int | None) -> str:
+        if self._is_default_knowledge_scope(knowledge_scope):
+            return "Workspace default"
+        if str(knowledge_scope or "").strip().lower() == "group":
+            return "Grupo do tenant"
+        if project_id:
+            return "Projeto atual"
+        return "Tenant atual"
+
+    def _prompt_requests_ai_recommendation(self, prompt: str) -> bool:
+        prompt_lower = str(prompt or "").lower()
+        triggers = [
+            "crie recomend",
+            "gere recomend",
+            "gere tarefa",
+            "crie tarefa",
+            "sugira ação",
+            "sugira acao",
+            "gere ação",
+            "gere acao",
+            "plano de ação",
+            "plano de acao",
+            "recomendação",
+            "recomendacao",
+        ]
+        return any(token in prompt_lower for token in triggers)
+
+    def _prompt_needs_deep_analysis(self, prompt: str) -> bool:
+        normalized = str(prompt or "").lower()
+        triggers = [
+            "relatório",
+            "relatorio",
+            "análise",
+            "analise",
+            "recomenda",
+            "dimens",
+            "aderente",
+            "aderência",
+            "aderencia",
+            "cultura de segurança",
+            "cultura de seguranca",
+            "completo",
+        ]
+        return any(token in normalized for token in triggers)
+
+    def _resolve_ai_target_tenant_and_project(self) -> tuple[str, int | None]:
+        target_tenant = self.selected_project_source_tenant if self.ai_scope_mode_effective == "projeto" else self.current_tenant
+        project_id = int(self.selected_project_id) if self.ai_scope_mode_effective == "projeto" and self.selected_project_id and self.selected_project_id.isdigit() else None
+        return target_tenant, project_id
+
+    def _group_tenant_ids_for_tenant(self, session, tenant_id: str) -> set[str]:
+        tenant_value = str(tenant_id or "").strip() or self.current_tenant
+        group_tenants = {tenant_value}
+        tenant_row = session.query(TenantModel).filter(TenantModel.id == tenant_value).first()
+        owner_client_id = int(tenant_row.owner_client_id) if tenant_row and tenant_row.owner_client_id is not None else None
+        if owner_client_id is None:
+            return group_tenants
+        client_pairs = [
+            ClientModel(id=row[0], parent_client_id=row[1])  # type: ignore[call-arg]
+            for row in session.query(ClientModel.id, ClientModel.parent_client_id).all()
+        ]
+        children_map = _build_client_children_map(client_pairs)
+        group_client_ids = {owner_client_id, *_collect_descendant_client_ids(children_map, owner_client_id)}
+        for row in session.query(TenantModel.id, TenantModel.owner_client_id).all():
+            row_client_id = int(row[1]) if row[1] is not None else None
+            if row_client_id is not None and row_client_id in group_client_ids:
+                group_tenants.add(str(row[0]))
+        return group_tenants
 
     def _resolve_ai_document_scope(self) -> tuple[str, int | None]:
         target_tenant = self.selected_project_source_tenant if self.ai_scope_mode_effective == "projeto" else self.current_tenant
@@ -781,19 +1115,24 @@ class State(SessionStateMixin):
 
     def _visible_ai_documents_query(self, session):
         target_tenant, project_id = self._resolve_ai_document_scope()
+        group_tenant_ids = sorted(self._group_tenant_ids_for_tenant(session, target_tenant))
         query = session.query(AssistantDocumentModel).filter(
             or_(
                 (
                     (AssistantDocumentModel.tenant_id == target_tenant)
                     & (AssistantDocumentModel.knowledge_scope == "tenant")
                 ),
-                (AssistantDocumentModel.knowledge_scope == "smartlab"),
+                (
+                    AssistantDocumentModel.tenant_id.in_(group_tenant_ids)
+                    & (AssistantDocumentModel.knowledge_scope == "group")
+                ),
+                self._default_knowledge_scope_filter(),
             )
         )
         if project_id is not None:
             query = query.filter(
                 (
-                    (AssistantDocumentModel.knowledge_scope == "smartlab")
+                    self._default_knowledge_scope_filter()
                     | (AssistantDocumentModel.project_id == project_id)
                     | (AssistantDocumentModel.project_id.is_(None))
                 )
@@ -834,7 +1173,7 @@ class State(SessionStateMixin):
                     "document_id": str(row.document_id),
                     "file_name": doc.file_name,
                     "resource_type": doc.resource_type or "politica",
-                    "project_scope": "Base SmartLab" if doc.knowledge_scope == "smartlab" else ("Projeto atual" if doc.project_id else "Tenant"),
+                    "project_scope": self._ai_document_scope_label(doc.knowledge_scope, doc.project_id),
                     "content": row.content,
                     "score": score,
                 }
@@ -890,9 +1229,11 @@ class State(SessionStateMixin):
 
     def _build_ai_factual_answer(self, prompt: str, insights: dict[str, Any]) -> str:
         prompt_lower = prompt.lower()
+        if self._prompt_needs_deep_analysis(prompt):
+            return ""
         asks_companies = any(term in prompt_lower for term in ["empresa", "empresas", "cliente", "clientes"])
         asks_respondents = any(term in prompt_lower for term in ["quem respondeu", "quem delas", "quem respondeu", "respondente", "respondentes", "nomes"])
-        asks_count = any(term in prompt_lower for term in ["quantas", "quantos", "número", "numero", "total"])
+        asks_count = bool(re.search(r"\b(quantas|quantos|número|numero|total)\b", prompt_lower))
         asks_interviews = any(term in prompt_lower for term in ["entrevista", "entrevistas"])
         asks_in_progress = any(term in prompt_lower for term in ["em andamento", "andamento", "aberta", "abertas"])
         asks_completed = any(term in prompt_lower for term in ["conclu", "finalizada", "finalizadas"])
@@ -963,6 +1304,128 @@ class State(SessionStateMixin):
             )
         return ""
 
+    def _build_ai_dimension_analysis_answer(self, prompt: str, insights: dict[str, Any], context: dict[str, str], rag_sources: str) -> str:
+        dimensions = insights.get("dimension_breakdown", [])
+        if not dimensions:
+            return ""
+        lines: list[str] = []
+        for item in dimensions:
+            avg = float(item["average"])
+            if avg < 2:
+                recommendation = "Prioridade crítica: atuar imediatamente com liderança, comunicação e reforço de comportamento seguro."
+            elif avg < 3:
+                recommendation = "Prioridade alta: criar ações de correção, rotina de acompanhamento e reforço operacional."
+            elif avg < 4:
+                recommendation = "Prioridade moderada: consolidar práticas e reduzir variação entre equipes."
+            else:
+                recommendation = "Boa aderência: manter disciplina, evidências e replicar a prática nas demais áreas."
+            lines.append(
+                f"- {item['dimension']}: média {item['average']} / 5, respostas {item['responses']}, leitura {item['maturity']}. {recommendation}"
+            )
+        executive = (
+            "Aderência baixa à cultura de segurança."
+            if any(float(item["average"]) < 2.5 for item in dimensions)
+            else (
+                "Aderência moderada à cultura de segurança."
+                if any(float(item["average"]) < 4 for item in dimensions)
+                else "Aderência alta à cultura de segurança."
+            )
+        )
+        return (
+            "Especialista IA SSecur1\n"
+            "Relatório analítico do contexto atual\n\n"
+            f"Leitura executiva: {executive}\n"
+            f"Total de respostas avaliadas: {insights['total_responses']}\n"
+            f"Empresas no contexto: {', '.join(insights['company_names']) or 'nenhuma'}\n"
+            f"Tenant analisado: {context['tenant']}\n\n"
+            "Análise por dimensões:\n"
+            f"{chr(10).join(lines)}\n\n"
+            "Recomendações gerais:\n"
+            "1. Priorizar as dimensões com média mais baixa para plano de ação imediato.\n"
+            "2. Cruzar as respostas críticas com política, procedimento e evidência do mesmo contexto.\n"
+            "3. Converter lacunas recorrentes em tarefas com responsável, prazo e evidência esperada.\n"
+            f"Fontes RAG consideradas: {rag_sources}."
+        )
+
+    def _extract_recommendations_from_ai_answer(self, answer: str) -> list[dict[str, str]]:
+        structured = self._extract_structured_recommendations(answer)
+        if structured:
+            return structured
+        raw_lines = [line.strip() for line in str(answer or "").splitlines() if line.strip()]
+        normalized_lines: list[str] = []
+        for line in raw_lines:
+            cleaned = re.sub(r"^\d+[\.\)\-:]\s*", "", line).strip()
+            cleaned = re.sub(r"^[-*]\s*", "", cleaned).strip()
+            if len(cleaned) < 12:
+                continue
+            lowered = cleaned.lower()
+            if lowered.startswith(("especialista ia", "relatório", "relatorio", "leitura executiva", "análise por dimens", "analise por dimens", "recomendações gerais", "recomendacoes gerais", "fontes rag", "tenant analisado", "total de respostas", "empresas no contexto")):
+                continue
+            if ":" in cleaned and len(cleaned.split(":", 1)[0]) < 28:
+                maybe_label, maybe_text = cleaned.split(":", 1)
+                if maybe_label.strip().lower() in {"1", "2", "3", "4", "5", "6", "recomendação", "recomendacao"}:
+                    cleaned = maybe_text.strip()
+            normalized_lines.append(cleaned)
+        recommendations: list[dict[str, str]] = []
+        seen_titles: set[str] = set()
+        for line in normalized_lines:
+            title = line.rstrip(".; ")
+            key = title.casefold()
+            if key in seen_titles:
+                continue
+            seen_titles.add(key)
+            recommendations.append(
+                {
+                    "title": title,
+                    "owner": "Liderança do processo",
+                    "due_date": _format_display_date(_now_brasilia() + timedelta(days=30)),
+                    "expected_result": f"Executar a recomendação '{title}' com evidência objetiva de conclusão.",
+                }
+            )
+            if len(recommendations) >= 6:
+                break
+        return recommendations
+
+    def _extract_structured_recommendations(self, answer: str) -> list[dict[str, str]]:
+        raw_answer = str(answer or "").strip()
+        if not raw_answer:
+            return []
+        candidates: list[str] = []
+        fenced_blocks = re.findall(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", raw_answer, flags=re.DOTALL | re.IGNORECASE)
+        candidates.extend(fenced_blocks)
+        candidates.extend(re.findall(r"(\{[\s\S]*\"recommendations\"[\s\S]*\})", raw_answer, flags=re.IGNORECASE))
+        seen: set[str] = set()
+        parsed_recommendations: list[dict[str, str]] = []
+        for candidate in candidates:
+            snippet = candidate.strip()
+            if not snippet or snippet in seen:
+                continue
+            seen.add(snippet)
+            try:
+                payload = json.loads(snippet)
+            except json.JSONDecodeError:
+                continue
+            items = payload.get("recommendations", []) if isinstance(payload, dict) else payload
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                title = str(item.get("title") or "").strip()
+                if not title:
+                    continue
+                parsed_recommendations.append(
+                    {
+                        "title": title,
+                        "owner": str(item.get("owner") or "Liderança do processo").strip() or "Liderança do processo",
+                        "due_date": str(item.get("due_date") or _format_display_date(_now_brasilia() + timedelta(days=30))).strip(),
+                        "expected_result": str(item.get("expected_result") or f"Executar a recomendação '{title}' com evidência objetiva de conclusão.").strip(),
+                    }
+                )
+            if parsed_recommendations:
+                break
+        return parsed_recommendations[:6]
+
     def _visible_client_ids(self, session) -> set[int] | None:
         if not (self.user_scope == "cliente" and self.user_client_id.isdigit()):
             return None
@@ -1005,10 +1468,7 @@ class State(SessionStateMixin):
                 query = query.filter(TenantModel.id == "default")
         rows = query.order_by(TenantModel.name.asc()).all()
         session.close()
-        return [
-            "SmartLab - interno" if row.id == "default" else f"{row.name} - cliente"
-            for row in rows
-        ]
+        return [self._workspace_label(str(row.id), str(row.name or "")) for row in rows]
 
     @rx.var(cache=False)
     def current_tenant_display(self) -> str:
@@ -1017,7 +1477,7 @@ class State(SessionStateMixin):
         session.close()
         if not tenant:
             return self.current_tenant
-        return "SmartLab - interno" if tenant.id == "default" else f"{tenant.name} - cliente"
+        return self._workspace_label(str(tenant.id), str(tenant.name or ""))
 
     @rx.var(cache=False)
     def global_search_results(self) -> list[dict[str, str]]:
@@ -1096,7 +1556,7 @@ class State(SessionStateMixin):
                             "kind": "Papel",
                             "title": row.name,
                             "subtitle": "Permissoes configuraveis",
-                            "view": "papeis",
+                            "view": "permissoes",
                             "record_id": str(row.id),
                         }
                     )
@@ -1106,110 +1566,290 @@ class State(SessionStateMixin):
 
     @rx.var
     def can_manage_clients(self) -> bool:
-        return "create:clientes" in ROLE_PERMS.get(self.user_role, set())
+        return self._is_resource_allowed("Gerenciar Clientes")
 
     @rx.var
     def can_manage_users(self) -> bool:
-        return "create:users" in ROLE_PERMS.get(self.user_role, set())
+        return self._is_resource_allowed("Gerenciar Usuarios")
 
     @rx.var
     def can_delete_users(self) -> bool:
-        return "delete:users" in ROLE_PERMS.get(self.user_role, set())
+        return self._is_resource_allowed("Gerenciar Usuarios")
+
+    @rx.var
+    def can_reset_user_password(self) -> bool:
+        return self._is_resource_allowed("Gerenciar Usuarios")
 
     @rx.var
     def can_delete_clients(self) -> bool:
-        return "delete:clientes" in ROLE_PERMS.get(self.user_role, set())
+        return self._is_resource_allowed("Gerenciar Clientes")
 
     @rx.var
     def can_manage_tenants(self) -> bool:
-        return "create:tenants" in ROLE_PERMS.get(self.user_role, set())
+        return self._is_resource_allowed("Gerenciar Tenants")
 
     @rx.var
     def can_delete_tenants(self) -> bool:
-        return "delete:tenants" in ROLE_PERMS.get(self.user_role, set())
+        return self._is_resource_allowed("Gerenciar Tenants")
 
     @rx.var
     def can_manage_roles(self) -> bool:
-        return "create:roles" in ROLE_PERMS.get(self.user_role, set())
+        return self._is_resource_allowed("Papeis e Responsabilidades")
 
     @rx.var
     def can_delete_roles(self) -> bool:
-        return "delete:roles" in ROLE_PERMS.get(self.user_role, set())
+        return self._is_resource_allowed("Papeis e Responsabilidades")
+
+    @rx.var
+    def can_manage_global_role_templates(self) -> bool:
+        return self.user_scope == "smartlab" and self.current_tenant == "default" and self.can_manage_roles
 
     @rx.var
     def can_manage_resps(self) -> bool:
-        return "create:responsabilidades" in ROLE_PERMS.get(self.user_role, set())
+        return self._is_resource_allowed("Papeis e Responsabilidades")
 
     @rx.var
     def can_delete_resps(self) -> bool:
-        return "delete:responsabilidades" in ROLE_PERMS.get(self.user_role, set())
+        return self._is_resource_allowed("Papeis e Responsabilidades")
 
     @rx.var
     def can_manage_forms(self) -> bool:
-        return "create:forms" in ROLE_PERMS.get(self.user_role, set())
+        return self._is_resource_allowed("Gerenciar Formularios")
 
     @rx.var
     def can_delete_forms(self) -> bool:
-        return "delete:forms" in ROLE_PERMS.get(self.user_role, set())
+        return self._is_resource_allowed("Gerenciar Formularios")
 
     @rx.var
     def can_operate_interviews(self) -> bool:
-        return self.user_scope == "smartlab" and self.current_tenant == "default" and self.can_manage_forms
+        return self._is_resource_allowed("Operar Entrevistas e Respostas")
 
     @rx.var
     def show_menu_clients(self) -> bool:
-        return self.user_scope == "smartlab"
+        if self.user_role == "sem_acesso":
+            return False
+        return self._is_resource_allowed("Clientes")
 
     @rx.var
     def show_menu_tenants(self) -> bool:
-        return self.user_scope == "smartlab" and self.user_role == "admin"
+        if self.user_role == "sem_acesso":
+            return False
+        return self._is_resource_allowed("Tenants")
 
     @rx.var
     def show_menu_users(self) -> bool:
-        return self.user_scope == "smartlab" or self.user_role == "cliente_admin"
+        if self.user_role == "sem_acesso":
+            return False
+        return self._is_resource_allowed("Usuarios")
 
     @rx.var
     def show_menu_permissions(self) -> bool:
-        return self.user_scope == "smartlab" or self.user_role == "cliente_admin"
+        if self.user_role == "sem_acesso":
+            return False
+        return self._is_resource_allowed("Canvas de Permissoes") or self._is_resource_allowed("Template RBAC")
 
     @rx.var
     def show_menu_dashboard(self) -> bool:
-        return True
+        return self._is_resource_allowed("Dashboard Executivo") or self._is_resource_allowed("Dashboard Operacional")
 
     @rx.var
     def show_menu_projects(self) -> bool:
-        return self.user_scope == "smartlab" and self.current_tenant == "default"
+        if self.user_role == "sem_acesso":
+            return False
+        return self._is_resource_allowed("Projetos")
 
     @rx.var
     def show_menu_plans(self) -> bool:
-        return True
+        return self._is_resource_allowed("Plano de Acoes")
 
     @rx.var
     def show_menu_apis(self) -> bool:
-        return self.user_scope == "smartlab" and self.user_role in {"admin", "editor"}
+        if self.user_role == "sem_acesso":
+            return False
+        return self._is_resource_allowed("APIs e Integrações")
 
     @rx.var
     def show_menu_roles(self) -> bool:
-        return self.user_scope == "smartlab"
+        return False
 
     @rx.var
     def show_menu_responsibilities(self) -> bool:
-        return self.user_scope == "smartlab"
+        return False
 
     @rx.var
     def show_menu_forms(self) -> bool:
-        return self.user_scope == "smartlab"
+        if self.user_role == "sem_acesso":
+            return False
+        return self._is_resource_allowed("Entrevistas e Respostas") or self._is_resource_allowed("Formularios")
 
     @rx.var
     def show_menu_ai(self) -> bool:
-        return self.user_scope == "smartlab"
+        if self.user_role == "sem_acesso":
+            return False
+        return self._is_resource_allowed("Especialista IA")
 
     @rx.var
     def show_menu_audit(self) -> bool:
-        return self.user_scope == "smartlab"
+        if self.user_role == "sem_acesso":
+            return False
+        return self._is_resource_allowed("Auditoria")
+
+    @rx.var
+    def has_platform_access(self) -> bool:
+        return self.user_role != "sem_acesso"
+
+    def _current_permission_set(self) -> set[str]:
+        session = SessionLocal()
+        row = None
+        if self.user_role in ROLE_TEMPLATE_CATALOG:
+            row = (
+                session.query(RoleModel.permissions)
+                .filter(
+                    RoleModel.tenant_id == "default",
+                    RoleModel.name == self.user_role,
+                )
+                .first()
+            )
+        if not row:
+            row = (
+                session.query(RoleModel.permissions)
+                .filter(
+                    RoleModel.tenant_id == self.current_tenant,
+                    RoleModel.name == self.user_role,
+                )
+                .first()
+            )
+        session.close()
+        if row:
+            return {item for item in _loads_json(row[0], []) if item}
+        return set(ROLE_PERMS.get(self.user_role, set()))
 
     def has_perm(self, perm: str) -> bool:
-        return perm in ROLE_PERMS.get(self.user_role, set())
+        return perm in self._current_permission_set()
+
+    def _workspace_label(self, tenant_id: str, tenant_name: str = "") -> str:
+        return tenant_id or tenant_name or "-"
+
+    def _permission_overrides_for(self, user_email: str, tenant_id: str) -> dict[str, str]:
+        email = (user_email or "").strip().lower()
+        if not email or not tenant_id:
+            return {}
+        session = SessionLocal()
+        rows = (
+            session.query(PermissionBoxModel.resource, PermissionBoxModel.decision)
+            .filter(
+                PermissionBoxModel.tenant_id == tenant_id,
+                PermissionBoxModel.user_email == email,
+            )
+            .all()
+        )
+        session.close()
+        return {str(resource): str(decision) for resource, decision in rows if resource and decision}
+
+    def _resource_allowed_from_profile(
+        self,
+        resource: str,
+        role_name: str,
+        user_scope: str,
+        tenant_id: str,
+        perm_set: set[str],
+    ) -> bool:
+        scope = user_scope or "smartlab"
+        is_default_workspace = tenant_id == "default"
+        role = role_name or "sem_acesso"
+        if role == "sem_acesso":
+            return False
+        if resource in {"Dashboard Executivo", "Dashboard Operacional", "Plano de Acoes", "Relatorio Executivo", "Relatorio Detalhado"}:
+            return True
+        if resource == "Clientes":
+            return scope == "smartlab"
+        if resource == "Gerenciar Clientes":
+            return scope == "smartlab" and bool(RESOURCE_PERMISSION_TOKENS[resource] & perm_set)
+        if resource == "Tenants":
+            return scope == "smartlab"
+        if resource == "Gerenciar Tenants":
+            return scope == "smartlab" and bool(RESOURCE_PERMISSION_TOKENS[resource] & perm_set)
+        if resource == "Usuarios":
+            return scope == "smartlab" or role == "cliente_admin" or bool(RESOURCE_PERMISSION_TOKENS["Gerenciar Usuarios"] & perm_set)
+        if resource == "Gerenciar Usuarios":
+            return bool(RESOURCE_PERMISSION_TOKENS[resource] & perm_set)
+        if resource == "Projetos":
+            return scope == "smartlab" and is_default_workspace
+        if resource == "Gerenciar Projetos":
+            return scope == "smartlab" and is_default_workspace
+        if resource == "Formularios":
+            return scope == "smartlab"
+        if resource == "Gerenciar Formularios":
+            return bool(RESOURCE_PERMISSION_TOKENS[resource] & perm_set)
+        if resource == "Entrevistas e Respostas":
+            return role != "sem_acesso"
+        if resource == "Operar Entrevistas e Respostas":
+            return scope == "smartlab" and is_default_workspace
+        if resource == "Template RBAC":
+            return scope == "smartlab" or role == "cliente_admin" or bool(RESOURCE_PERMISSION_TOKENS["Papeis e Responsabilidades"] & perm_set)
+        if resource == "Canvas de Permissoes":
+            return scope == "smartlab" or role == "cliente_admin" or bool(RESOURCE_PERMISSION_TOKENS[resource] & perm_set)
+        if resource == "Papeis e Responsabilidades":
+            return scope == "smartlab" or role == "cliente_admin" or bool(RESOURCE_PERMISSION_TOKENS[resource] & perm_set)
+        if resource == "APIs e Integrações":
+            return scope == "smartlab" and is_default_workspace
+        if resource == "Auditoria":
+            return scope == "smartlab"
+        if resource in {"Especialista IA", "Operar Especialista IA"}:
+            return scope == "smartlab"
+        return False
+
+    def _role_permission_set_for_user(self, role_name: str, tenant_id: str) -> set[str]:
+        if not role_name:
+            return set()
+        session = SessionLocal()
+        row = None
+        if role_name in ROLE_TEMPLATE_CATALOG:
+            row = (
+                session.query(RoleModel.permissions)
+                .filter(RoleModel.tenant_id == "default", RoleModel.name == role_name)
+                .first()
+            )
+        if not row:
+            row = (
+                session.query(RoleModel.permissions)
+                .filter(RoleModel.tenant_id == tenant_id, RoleModel.name == role_name)
+                .first()
+            )
+        session.close()
+        if row:
+            return {item for item in _loads_json(row[0], []) if item}
+        return set(ROLE_PERMS.get(role_name, set()))
+
+    def _effective_permission_decisions_for(
+        self,
+        user_email: str,
+        role_name: str,
+        user_scope: str,
+        tenant_id: str,
+    ) -> dict[str, str]:
+        perm_set = self._role_permission_set_for_user(role_name, tenant_id)
+        decisions = {
+            item["resource"]: (
+                "permitido"
+                if self._resource_allowed_from_profile(item["resource"], role_name, user_scope, tenant_id, perm_set)
+                else "negado"
+            )
+            for item in PERMISSION_RESOURCE_CATALOG
+        }
+        decisions.update(self._permission_overrides_for(user_email, tenant_id))
+        return decisions
+
+    def _current_user_permission_decisions(self) -> dict[str, str]:
+        return self._effective_permission_decisions_for(
+            self.login_email.strip().lower(),
+            self.user_role,
+            self.user_scope,
+            self.current_tenant,
+        )
+
+    def _is_resource_allowed(self, resource: str) -> bool:
+        return self._current_user_permission_decisions().get(resource, "negado") == "permitido"
 
     @rx.var(cache=False)
     def tenants_data(self) -> list[dict[str, Any]]:
@@ -1239,13 +1879,13 @@ class State(SessionStateMixin):
                 "owner_client_id": str(r.owner_client_id) if r.owner_client_id is not None else "-",
                 "owner_client_name": client_lookup.get(r.owner_client_id, "SmartLab"),
                 "owner_client_cnpj": client_cnpj_lookup.get(r.owner_client_id, "-"),
-                "created_at": r.created_at.strftime("%Y-%m-%d") if r.created_at else "-",
+                "created_at": _format_display_date(r.created_at),
                 "document_count": str(document_counts.get(r.id, 0)),
                 "project_count": str(project_counts.get(r.id, 0)),
                 "form_count": str(form_counts.get(r.id, 0)),
                 "client_scope_count": str(len([item for item in _loads_json(r.assigned_client_ids, []) if str(item).isdigit()])),
                 "client_scope_summary": (
-                    "SmartLab default: acesso total"
+                    "default: acesso total"
                     if r.id == "default"
                     else ", ".join(
                         client_lookup.get(int(item), str(item))
@@ -1297,14 +1937,21 @@ class State(SessionStateMixin):
     @rx.var
     def ai_knowledge_scope_options(self) -> list[str]:
         options = ["tenant"]
+        session = SessionLocal()
+        target_tenant, _ = self._resolve_ai_document_scope()
+        if len(self._group_tenant_ids_for_tenant(session, target_tenant)) > 1:
+            options.append("group")
+        session.close()
         if self.user_scope == "smartlab":
-            options.append("smartlab")
+            options.append("default")
         return options
 
     @rx.var
     def ai_knowledge_scope_effective(self) -> str:
-        if self.ai_knowledge_scope == "smartlab" and self.user_scope == "smartlab":
-            return "smartlab"
+        if self.ai_knowledge_scope == "group" and "group" in self.ai_knowledge_scope_options:
+            return "group"
+        if self._is_default_knowledge_scope(self.ai_knowledge_scope) and self.user_scope == "smartlab":
+            return "default"
         return "tenant"
 
     @rx.var
@@ -1438,7 +2085,7 @@ class State(SessionStateMixin):
             query = query.filter(TenantModel.id == self.home_tenant_id)
         rows = query.order_by(TenantModel.name.asc()).all()
         session.close()
-        return [f"{row.id} - {row.name}" for row in rows]
+        return [self._workspace_label(str(row.id), str(row.name or "")) for row in rows]
 
     @rx.var
     def selected_new_user_workspace_option(self) -> str:
@@ -1447,7 +2094,7 @@ class State(SessionStateMixin):
         session = SessionLocal()
         tenant = session.query(TenantModel).filter(TenantModel.id == self.new_user_tenant_id).first()
         session.close()
-        return f"{tenant.id} - {tenant.name}" if tenant else self.new_user_tenant_id
+        return self._workspace_label(str(tenant.id), str(tenant.name or "")) if tenant else self.new_user_tenant_id
 
     @rx.var
     def selected_new_user_client_option(self) -> str:
@@ -1499,7 +2146,7 @@ class State(SessionStateMixin):
     @rx.var
     def selected_tenant_assigned_clients_summary(self) -> str:
         if self.new_tenant_slug == "default":
-            return "SmartLab default: acesso total e irrestrito"
+            return "default: acesso total e irrestrito"
         if not self.new_tenant_assigned_client_ids:
             return "Clique para escolher os clientes do tenant"
         names = [
@@ -1646,6 +2293,10 @@ class State(SessionStateMixin):
         return "Salvar Alterações" if self.is_editing_role else "Criar Papel"
 
     @rx.var
+    def is_editing_role_template(self) -> bool:
+        return self.editing_role_template_key != ""
+
+    @rx.var
     def is_editing_resp(self) -> bool:
         return self.editing_resp_id != ""
 
@@ -1768,7 +2419,9 @@ class State(SessionStateMixin):
                 "name": "Selecione um usuario",
                 "email": "Nenhuma conta foi escolhida ainda.",
                 "role": "-",
+                "role_label": "-",
                 "scope": "-",
+                "scope_label": "-",
                 "tenant": "-",
                 "client": "-",
             }
@@ -1791,18 +2444,62 @@ class State(SessionStateMixin):
                 "name": "Usuario nao encontrado",
                 "email": self.perm_user_email.strip().lower(),
                 "role": "-",
+                "role_label": "-",
                 "scope": "-",
+                "scope_label": "-",
                 "tenant": "-",
                 "client": "-",
             }
+        role_name = user.role or "viewer"
+        role_label = role_name
+        if role_name in ROLE_TEMPLATE_CATALOG:
+            role_label = str(ROLE_TEMPLATE_CATALOG[role_name]["label"])
+        else:
+            session = SessionLocal()
+            role = (
+                session.query(RoleModel.name)
+                .filter(RoleModel.tenant_id == self.current_tenant, RoleModel.name == role_name)
+                .first()
+            )
+            session.close()
+            if role and role[0]:
+                role_label = str(role[0])
         return {
             "name": user.name,
             "email": user.email,
-            "role": user.role or "viewer",
+            "role": role_name,
+            "role_label": role_label,
             "scope": user.account_scope or "smartlab",
+            "scope_label": "SmartLab" if (user.account_scope or "smartlab") == "smartlab" else "Cliente",
             "tenant": user.tenant_id,
             "client": client_name,
         }
+
+    @rx.var(cache=False)
+    def selected_access_responsibilities(self) -> list[str]:
+        if not self.has_valid_permission_principal:
+            return []
+        session = SessionLocal()
+        role_name = (self.selected_access_principal.get("role", "") or "").strip()
+        role = (
+            session.query(RoleModel)
+            .filter(RoleModel.tenant_id == self.current_tenant, RoleModel.name == role_name)
+            .first()
+        )
+        if not role:
+            session.close()
+            return []
+        rows = (
+            session.query(ResponsibilityModel.description)
+            .filter(
+                ResponsibilityModel.tenant_id == self.current_tenant,
+                ResponsibilityModel.role_id == role.id,
+            )
+            .order_by(ResponsibilityModel.id.asc())
+            .all()
+        )
+        session.close()
+        return [str(row[0]) for row in rows if row and row[0]]
 
     @rx.var(cache=False)
     def has_valid_permission_principal(self) -> bool:
@@ -1820,12 +2517,25 @@ class State(SessionStateMixin):
             .order_by(RoleModel.id.desc())
             .all()
         )
+        responsibility_rows = (
+            session.query(ResponsibilityModel.role_id, ResponsibilityModel.description)
+            .filter(ResponsibilityModel.tenant_id == self.current_tenant)
+            .order_by(ResponsibilityModel.id.asc())
+            .all()
+        )
+        responsibility_map: dict[int, list[str]] = {}
+        for role_id, description in responsibility_rows:
+            if role_id is None or not description:
+                continue
+            responsibility_map.setdefault(int(role_id), []).append(str(description))
         data = [
             {
                 "id": r.id,
                 "name": r.name,
                 "permissions": json.loads(r.permissions or "[]"),
                 "permissions_str": ", ".join(json.loads(r.permissions or "[]")),
+                "responsibilities": responsibility_map.get(int(r.id), []),
+                "responsibilities_str": "\n".join(responsibility_map.get(int(r.id), [])) or "-",
                 "tenant_id": r.tenant_id,
             }
             for r in rows
@@ -1836,6 +2546,71 @@ class State(SessionStateMixin):
     @rx.var
     def role_id_options(self) -> list[str]:
         return [str(r["id"]) for r in self.roles_data]
+
+    @rx.var
+    def role_permission_module_options(self) -> list[str]:
+        modules = ["Todos"]
+        modules.extend(sorted({item["module"] for item in ROLE_PERMISSION_CATALOG}))
+        return modules
+
+    @rx.var(cache=False)
+    def selected_role_permissions(self) -> list[str]:
+        return [item.strip() for item in self.new_role_permissions.split(",") if item.strip()]
+
+    @rx.var(cache=False)
+    def selected_role_permissions_summary(self) -> str:
+        items = self.selected_role_permissions
+        if not items:
+            return "Nenhuma permissao escolhida ainda"
+        return ", ".join(items)
+
+    @rx.var(cache=False)
+    def selected_role_permission_details(self) -> list[dict[str, str]]:
+        catalog_map = {item["token"]: item for item in ROLE_PERMISSION_CATALOG}
+        details: list[dict[str, str]] = []
+        for token in self.selected_role_permissions:
+            item = catalog_map.get(token, {})
+            details.append(
+                {
+                    "module": str(item.get("module", "Customizado")),
+                    "token": token,
+                    "label": str(item.get("label", token)),
+                    "description": str(item.get("description", "Permissao adicionada manualmente ao papel.")),
+                }
+            )
+        return details
+
+    @rx.var(cache=False)
+    def available_role_permission_choices(self) -> list[str]:
+        items = ROLE_PERMISSION_CATALOG
+        if self.role_permission_module_filter != "Todos":
+            items = [item for item in items if item["module"] == self.role_permission_module_filter]
+        return [f'{item["token"]} - {item["label"]}' for item in items]
+
+    @rx.var(cache=False)
+    def selected_role_permission_catalog(self) -> list[dict[str, str]]:
+        items = ROLE_PERMISSION_CATALOG
+        if self.role_permission_module_filter != "Todos":
+            items = [item for item in items if item["module"] == self.role_permission_module_filter]
+        selected = set(self.selected_role_permissions)
+        return [
+            {
+                "module": item["module"],
+                "token": item["token"],
+                "label": item["label"],
+                "description": item["description"],
+                "selected": "sim" if item["token"] in selected else "nao",
+            }
+            for item in items
+        ]
+
+    @rx.var(cache=False)
+    def available_role_permissions_data(self) -> list[dict[str, str]]:
+        return [item for item in self.selected_role_permission_catalog if item["selected"] != "sim"]
+
+    @rx.var(cache=False)
+    def chosen_role_permissions_data(self) -> list[dict[str, str]]:
+        return [item for item in self.selected_role_permission_catalog if item["selected"] == "sim"]
 
     @rx.var(cache=False)
     def responsibilities_data(self) -> list[dict[str, Any]]:
@@ -2318,7 +3093,7 @@ class State(SessionStateMixin):
                 "target_area": row.target_area or "-",
                 "audience_group": row.audience_group or "-",
                 "consultant_name": row.consultant_name or "-",
-                "interview_date": row.interview_date or "-",
+                "interview_date": _format_display_date(row.interview_date),
                 "status": row.status or "em_andamento",
                 "responses": str(response_counts.get(int(row.id), 0)),
                 "total_score": str(row.total_score or 0),
@@ -2366,7 +3141,7 @@ class State(SessionStateMixin):
                 "target_area": self.new_interview_area or "-",
                 "audience_group": self.new_interview_group_name or "-",
                 "consultant_name": self.login_email.strip().lower() or "-",
-                "interview_date": self.new_interview_date or "-",
+                "interview_date": _format_display_date(self.new_interview_date),
                 "status": "rascunho",
                 "responses": "0",
                 "total_score": "0",
@@ -2709,7 +3484,7 @@ class State(SessionStateMixin):
                 "service_name": r.service_name or "Diagnóstico Cultura de Segurança",
                 "client_id": str(r.client_id) if r.client_id is not None else "",
                 "client_name": self.client_lookup.get(str(r.client_id), "-") if r.client_id is not None else "-",
-                "contracted_at": r.contracted_at or "-",
+                "contracted_at": _format_display_date(r.contracted_at),
                 "status": r.status,
                 "progress": r.progress,
                 "source_tenant": r.tenant_id,
@@ -2758,7 +3533,7 @@ class State(SessionStateMixin):
 
     @rx.var
     def can_configure_projects(self) -> bool:
-        return self.user_scope == "smartlab" and self.current_tenant == "default"
+        return self._is_resource_allowed("Gerenciar Projetos")
 
     @rx.var(cache=False)
     def smartlab_service_options(self) -> list[str]:
@@ -2920,6 +3695,95 @@ class State(SessionStateMixin):
             f"Contratado em: {project.get('contracted_at', '-')}"
         )
 
+    @rx.var(cache=False)
+    def project_action_people(self) -> list[dict[str, str]]:
+        if not self.selected_project_id or not self.selected_project_id.isdigit():
+            return []
+        session = SessionLocal()
+        project = (
+            session.query(ProjectModel)
+            .filter(
+                ProjectModel.id == int(self.selected_project_id),
+                ProjectModel.tenant_id == self.selected_project_source_tenant,
+            )
+            .first()
+        )
+        assigned_client_ids = {
+            str(row[0])
+            for row in session.query(ProjectAssignmentModel.client_id).filter(
+                ProjectAssignmentModel.project_id == int(self.selected_project_id),
+                ProjectAssignmentModel.client_id.is_not(None),
+            ).all()
+        }
+        if project and project.client_id is not None:
+            assigned_client_ids.add(str(project.client_id))
+        query = session.query(UserModel).filter(UserModel.tenant_id == self.selected_project_source_tenant)
+        if assigned_client_ids:
+            query = query.filter(UserModel.client_id.in_([int(item) for item in assigned_client_ids if item.isdigit()]))
+        rows = query.order_by(UserModel.department.asc(), UserModel.name.asc()).all()
+        session.close()
+        return [
+            {
+                "id": str(row.id),
+                "label": f"{row.name or row.email} - {row.department or 'Sem área'}",
+                "name": row.name or row.email,
+                "department": row.department or "Sem área",
+                "profession": row.profession or "-",
+                "email": row.email,
+            }
+            for row in rows
+        ]
+
+    @rx.var(cache=False)
+    def project_action_area_options(self) -> list[str]:
+        names = sorted({item["department"] for item in self.project_action_people if item["department"]})
+        return names or ["Sem área"]
+
+    @rx.var(cache=False)
+    def project_action_owner_options(self) -> list[str]:
+        items = self.project_action_people
+        if self.new_action_area.strip():
+            items = [item for item in items if item["department"] == self.new_action_area.strip()]
+        return [item["label"] for item in items]
+
+    @rx.var(cache=False)
+    def action_dimension_options(self) -> list[str]:
+        items = [item for item in self.question_dimension_options if item not in {"Outro"}]
+        return items
+
+    @rx.var
+    def selected_action_dimensions_summary(self) -> str:
+        if not self.new_action_dimension_ids:
+            return "Nenhuma dimensão selecionada"
+        return ", ".join(self.new_action_dimension_ids)
+
+    @rx.var(cache=False)
+    def action_plan_options(self) -> list[str]:
+        return [f'{item["id"]} - {item["title"]}' for item in self.action_plans_data]
+
+    @rx.var
+    def selected_action_plan_option(self) -> str:
+        if not self.selected_action_plan_id:
+            return ""
+        target = next((item for item in self.action_plans_data if str(item["id"]) == self.selected_action_plan_id), None)
+        if not target:
+            return ""
+        return f'{target["id"]} - {target["title"]}'
+
+    @rx.var
+    def effective_action_plan_target_id(self) -> str:
+        return self.editing_action_plan_id or self.selected_action_plan_id
+
+    @rx.var
+    def effective_action_plan_target_label(self) -> str:
+        target_id = self.effective_action_plan_target_id
+        if not target_id:
+            return ""
+        target = next((item for item in self.action_plans_data if str(item["id"]) == str(target_id)), None)
+        if not target:
+            return ""
+        return f'{target["id"]} - {target["title"]}'
+
     @rx.var
     def selected_project_link_clients_summary(self) -> str:
         if not self.new_project_assigned_client_ids:
@@ -3050,6 +3914,296 @@ class State(SessionStateMixin):
             if b["box_type"] == "nota"
         ]
 
+    def _workflow_stage_semantics(self, box: dict[str, Any]) -> dict[str, Any]:
+        config = dict(box.get("config", {}))
+        zone = str(box.get("zone", config.get("zone", "center")))
+        if zone not in {"left", "center", "right"}:
+            zone = "center"
+        context_lookup = {"left": "Preparacao", "center": "Execucao", "right": "Fechamento"}
+        stage_type_lookup = {
+            "trigger": "Marco de inicio",
+            "etapa": "Etapa operacional",
+            "coleta": "Coleta e evidencias",
+            "analise": "Analise e diagnostico",
+            "relatorio": "Devolutiva e plano",
+            "nota": "Observacao",
+        }
+        trigger = (
+            str(config.get("trigger", "")).strip()
+            or str(config.get("schedule", "")).strip()
+            or str(config.get("condition", "")).strip()
+            or "Fluxo definido manualmente"
+        )
+        expected_output = (
+            str(config.get("expected_output", "")).strip()
+            or str(config.get("output_key", "")).strip()
+            or "Sem entrega definida"
+        )
+        owner = str(config.get("owner", "")).strip() or "Responsavel nao definido"
+        objective = str(config.get("objective", "")).strip() or "Objetivo ainda nao detalhado"
+        return {
+            "id": box["id"],
+            "title": str(box.get("title", "")),
+            "box_type": str(box.get("box_type", "etapa")),
+            "stage_type_label": stage_type_lookup.get(str(box.get("box_type", "etapa")), "Etapa operacional"),
+            "position": int(box.get("position", 0) or 0),
+            "zone": zone,
+            "context": context_lookup.get(zone, "Execucao"),
+            "objective": objective,
+            "owner": owner,
+            "trigger": trigger,
+            "expected_output": expected_output,
+            "source": str(config.get("source", "manual")),
+            "note": str(config.get("note", "")).strip(),
+        }
+
+    @rx.var(cache=False)
+    def workflow_operational_stages(self) -> list[dict[str, Any]]:
+        return [
+            self._workflow_stage_semantics(box)
+            for box in self.workflow_boxes_data
+            if box["box_type"] != "nota"
+        ]
+
+    @rx.var(cache=False)
+    def workflow_left_stages(self) -> list[dict[str, Any]]:
+        return [item for item in self.workflow_operational_stages if item["zone"] == "left"]
+
+    @rx.var(cache=False)
+    def workflow_center_stages(self) -> list[dict[str, Any]]:
+        return [item for item in self.workflow_operational_stages if item["zone"] == "center"]
+
+    @rx.var(cache=False)
+    def workflow_right_stages(self) -> list[dict[str, Any]]:
+        return [item for item in self.workflow_operational_stages if item["zone"] == "right"]
+
+    @rx.var(cache=False)
+    def workflow_stage_summary(self) -> list[dict[str, str]]:
+        stages = self.workflow_operational_stages
+        owner_count = sum(1 for item in stages if item["owner"] != "Responsavel nao definido")
+        return [
+            {
+                "label": "Etapas configuradas",
+                "value": str(len(stages)),
+                "detail": "jornada operacional registrada para o projeto",
+            },
+            {
+                "label": "Responsaveis definidos",
+                "value": f"{owner_count}/{len(stages) or 0}",
+                "detail": "etapas com dono operacional declarado",
+            },
+            {
+                "label": "Planos de acao",
+                "value": str(len(self.action_plans_data)),
+                "detail": "itens de follow-up ja cadastrados neste projeto",
+            },
+            {
+                "label": "Cobertura da jornada",
+                "value": "Completa" if len(stages) >= 4 else "Parcial",
+                "detail": "avaliacao simples para orientar a montagem inicial",
+            },
+        ]
+
+    @rx.var(cache=False)
+    def workflow_stage_templates(self) -> list[dict[str, str]]:
+        return [
+            {
+                "key": item["key"],
+                "title": item["title"],
+                "context": item["context"],
+                "objective": item["objective"],
+                "owner": item["owner"],
+                "trigger": item["trigger"],
+                "expected_output": item["expected_output"],
+            }
+            for item in WORKFLOW_STAGE_LIBRARY
+        ]
+
+    @rx.var(cache=False)
+    def workflow_missing_stage_templates(self) -> list[dict[str, str]]:
+        existing = {item["title"].casefold() for item in self.workflow_operational_stages}
+        return [
+            {
+                "key": item["key"],
+                "title": item["title"],
+                "context": item["context"],
+                "objective": item["objective"],
+                "owner": item["owner"],
+                "trigger": item["trigger"],
+                "expected_output": item["expected_output"],
+            }
+            for item in WORKFLOW_STAGE_LIBRARY
+            if item["title"].casefold() not in existing
+        ]
+
+    def _parse_iso_date(self, raw_value: str | None) -> datetime | None:
+        value = str(raw_value or "").strip()
+        if not value:
+            return None
+        for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y"):
+            try:
+                return datetime.strptime(value, fmt)
+            except ValueError:
+                continue
+        return None
+
+    def _normalize_action_tasks(self, raw_tasks: list[dict[str, Any]] | Any) -> list[dict[str, Any]]:
+        if not isinstance(raw_tasks, list):
+            return []
+        tasks: list[dict[str, Any]] = []
+        for item in raw_tasks:
+            if not isinstance(item, dict):
+                continue
+            progress = max(0, min(100, int(item.get("progress", 0) or 0)))
+            tasks.append(
+                {
+                    "title": str(item.get("title", "")).strip() or "Tarefa sem nome",
+                    "owner": str(item.get("owner", "")).strip() or "Responsavel nao definido",
+                    "start_date": str(item.get("start_date", "")).strip(),
+                    "planned_due_date": str(item.get("planned_due_date", "")).strip(),
+                    "due_date": str(item.get("due_date", "")).strip(),
+                    "expected_result": str(item.get("expected_result", "")).strip(),
+                    "progress": progress,
+                }
+            )
+        return tasks
+
+    def _schedule_progress_percent(self, start_date: str, due_date: str) -> int:
+        start_dt = self._parse_iso_date(start_date)
+        due_dt = self._parse_iso_date(due_date)
+        if not start_dt or not due_dt or due_dt < start_dt:
+            return 0
+        today = _now_brasilia().date()
+        start_day = start_dt.date()
+        due_day = due_dt.date()
+        if today <= start_day:
+            return 0
+        total_days = max((due_day - start_day).days, 1)
+        elapsed_days = min(max((today - start_day).days, 0), total_days)
+        return max(0, min(100, round((elapsed_days / total_days) * 100)))
+
+    def _action_progress_metrics(
+        self,
+        start_date: str,
+        planned_due_date: str,
+        due_date: str,
+        tasks: list[dict[str, Any]],
+        attainment: int,
+        status: str,
+        completed_at: str,
+    ) -> dict[str, Any]:
+        normalized_tasks = self._normalize_action_tasks(tasks)
+        task_progress = round(sum(int(item["progress"]) for item in normalized_tasks) / len(normalized_tasks)) if normalized_tasks else int(attainment or 0)
+        schedule_basis = planned_due_date or due_date
+        schedule_progress = self._schedule_progress_percent(start_date, schedule_basis)
+        overall_progress = 100 if normalized_tasks and all(int(item["progress"]) >= 100 for item in normalized_tasks) else round((task_progress * 0.7) + (schedule_progress * 0.3))
+        planned_dt = self._parse_iso_date(planned_due_date)
+        current_due_dt = self._parse_iso_date(due_date)
+        completed_dt = self._parse_iso_date(completed_at)
+        current_variance = (current_due_dt - planned_dt).days if planned_dt and current_due_dt else 0
+        completion_variance = (completed_dt - planned_dt).days if planned_dt and completed_dt else 0
+        delay_label = "No prazo"
+        if status == "concluido" and completed_dt and planned_dt:
+            if completion_variance > 0:
+                delay_label = f"{completion_variance} dia(s) de atraso"
+            elif completion_variance < 0:
+                delay_label = f"{abs(completion_variance)} dia(s) antes do prazo"
+        elif current_variance > 0:
+            delay_label = f"{current_variance} dia(s) prorrogado(s)"
+        elif current_variance < 0:
+            delay_label = f"{abs(current_variance)} dia(s) antecipado(s)"
+        return {
+            "tasks": normalized_tasks,
+            "task_progress": task_progress,
+            "schedule_progress": schedule_progress,
+            "overall_progress": max(0, min(100, overall_progress)),
+            "current_variance_days": current_variance,
+            "completion_variance_days": completion_variance,
+            "delay_label": delay_label,
+            "task_done_count": sum(1 for item in normalized_tasks if int(item["progress"]) >= 100),
+        }
+
+    def _task_delay_label(self, planned_due_date: str, due_date: str, progress: int) -> str:
+        planned_dt = self._parse_iso_date(planned_due_date)
+        due_dt = self._parse_iso_date(due_date)
+        if not planned_dt or not due_dt:
+            return "Prazo nao definido"
+        variance = (due_dt - planned_dt).days
+        if progress >= 100:
+            if variance > 0:
+                return f"{variance} dia(s) de atraso"
+            if variance < 0:
+                return f"{abs(variance)} dia(s) antes do prazo"
+            return "Concluida no prazo"
+        if variance > 0:
+            return f"{variance} dia(s) prorrogado(s)"
+        if variance < 0:
+            return f"{abs(variance)} dia(s) antecipado(s)"
+        return "No prazo"
+
+    @rx.var(cache=False)
+    def action_plan_tasks_data(self) -> list[dict[str, Any]]:
+        if not self.selected_project_id:
+            return []
+        session = SessionLocal()
+        plan_rows = session.query(
+            ActionPlanModel.id,
+            ActionPlanModel.title,
+            ActionPlanModel.client_id,
+            ActionPlanModel.service_name,
+            ActionPlanModel.dimension_names,
+        ).filter(
+                ActionPlanModel.tenant_id == self.selected_project_source_tenant,
+                ActionPlanModel.project_id == int(self.selected_project_id),
+            ).all()
+        plan_ids = [int(row[0]) for row in plan_rows]
+        if not plan_ids:
+            session.close()
+            return []
+        plan_lookup = {
+            int(plan_id): {
+                "plan_title": plan_title,
+                "client_name": self.client_lookup.get(str(client_id), "-") if client_id is not None else self.selected_project_record["client_name"],
+                "service_name": service_name or self.selected_project_record["service_name"],
+                "dimensions": dimension_names or "-",
+            }
+            for plan_id, plan_title, client_id, service_name, dimension_names in plan_rows
+        }
+        rows = (
+            session.query(ActionTaskModel)
+            .filter(
+                ActionTaskModel.tenant_id == self.selected_project_source_tenant,
+                ActionTaskModel.action_plan_id.in_(plan_ids),
+            )
+            .order_by(ActionTaskModel.action_plan_id.asc(), ActionTaskModel.id.asc())
+            .all()
+        )
+        data = [
+            {
+                "id": int(row.id),
+                "action_id": int(row.action_plan_id),
+                "plan_title": str(plan_lookup.get(int(row.action_plan_id), {}).get("plan_title", "-")),
+                "title": row.title,
+                "project_name": self.selected_project_record["name"],
+                "service_name": str(plan_lookup.get(int(row.action_plan_id), {}).get("service_name", self.selected_project_record["service_name"])),
+                "client_name": str(plan_lookup.get(int(row.action_plan_id), {}).get("client_name", self.selected_project_record["client_name"])),
+                "owner": row.owner,
+                "dimensions": str(plan_lookup.get(int(row.action_plan_id), {}).get("dimensions", "-")),
+                "expected_result": row.expected_result or "-",
+                "start_date": _format_display_date(row.start_date),
+                "planned_due_date": _format_display_date(row.planned_due_date),
+                "due_date": _format_display_date(row.due_date),
+                "due_date_change_count": int(row.due_date_change_count or 0),
+                "progress": int(row.progress or 0),
+                "schedule_progress": self._schedule_progress_percent(row.start_date or "", row.planned_due_date or row.due_date or ""),
+                "delay_label": self._task_delay_label(row.planned_due_date or row.due_date or "", row.due_date or "", int(row.progress or 0)),
+                "status": "concluido" if int(row.progress or 0) >= 100 else ("em_andamento" if int(row.progress or 0) > 0 else "a_fazer"),
+            }
+            for row in rows
+        ]
+        session.close()
+        return data
+
     @rx.var(cache=False)
     def action_plans_data(self) -> list[dict[str, Any]]:
         if not self.selected_project_id:
@@ -3064,20 +4218,61 @@ class State(SessionStateMixin):
             .order_by(ActionPlanModel.id.desc())
             .all()
         )
+        task_rows = (
+            session.query(ActionTaskModel)
+            .filter(
+                ActionTaskModel.tenant_id == self.selected_project_source_tenant,
+                ActionTaskModel.action_plan_id.in_([int(row.id) for row in rows]) if rows else False,
+            )
+            .order_by(ActionTaskModel.id.asc())
+            .all()
+        ) if rows else []
+        task_lookup: dict[int, list[dict[str, Any]]] = {}
+        for task in task_rows:
+            task_lookup.setdefault(int(task.action_plan_id), []).append(
+                {
+                    "id": int(task.id),
+                    "title": task.title,
+                    "owner": task.owner,
+                    "start_date": task.start_date or "",
+                    "due_date": task.due_date or "",
+                    "progress": int(task.progress or 0),
+                }
+            )
         data = [
             {
-                "id": r.id,
-                "title": r.title,
-                "client_name": self.client_lookup.get(str(r.client_id), "-") if r.client_id is not None else self.selected_project_record["client_name"],
-                "service_name": r.service_name or self.selected_project_record["service_name"],
-                "dimensions": r.dimension_names or "-",
-                "target_area": r.target_area or "-",
-                "owner": r.owner,
-                "due_date": r.due_date,
-                "status": r.status,
-                "expected_result": r.expected_result,
-                "actual_result": r.actual_result,
-                "attainment": r.attainment,
+                **(lambda metrics: {
+                    "id": r.id,
+                    "title": r.title,
+                    "client_name": self.client_lookup.get(str(r.client_id), "-") if r.client_id is not None else self.selected_project_record["client_name"],
+                    "service_name": r.service_name or self.selected_project_record["service_name"],
+                    "dimensions": r.dimension_names or "-",
+                    "target_area": r.target_area or "-",
+                    "owner": r.owner,
+                    "start_date": _format_display_date(r.start_date),
+                    "planned_due_date": _format_display_date(r.planned_due_date),
+                    "due_date": _format_display_date(r.due_date),
+                    "due_date_change_count": int(r.due_date_change_count or 0),
+                    "status": r.status,
+                    "expected_result": r.expected_result,
+                    "actual_result": r.actual_result,
+                    "attainment": int(r.attainment or 0),
+                    "progress": int(metrics["overall_progress"]),
+                    "schedule_progress": int(metrics["schedule_progress"]),
+                    "task_progress": int(metrics["task_progress"]),
+                    "delay_label": str(metrics["delay_label"]),
+                    "task_count": str(len(metrics["tasks"])),
+                    "task_done_count": str(metrics["task_done_count"]),
+                    "completed_at": _format_display_date(r.completed_at),
+                })(self._action_progress_metrics(
+                    r.start_date or "",
+                    r.planned_due_date or "",
+                    r.due_date or "",
+                    task_lookup.get(int(r.id), []),
+                    int(r.attainment or 0),
+                    r.status or "a_fazer",
+                    r.completed_at or "",
+                ))
             }
             for r in rows
         ]
@@ -3085,16 +4280,31 @@ class State(SessionStateMixin):
         return data
 
     @rx.var(cache=False)
+    def action_plan_summary_cards(self) -> list[dict[str, str]]:
+        delayed = 0
+        for item in self.action_plans_data:
+            if "atraso" in item["delay_label"] or "prorrogado" in item["delay_label"]:
+                delayed += 1
+        avg_progress = round(sum(int(item["progress"]) for item in self.action_plans_data) / len(self.action_plans_data)) if self.action_plans_data else 0
+        total_tasks = len(self.action_plan_tasks_data)
+        return [
+            {"label": "Planos do Projeto", "value": str(len(self.action_plans_data)), "detail": "registros de plano vinculados ao projeto"},
+            {"label": "Tarefas dos Planos", "value": str(total_tasks), "detail": "tarefas operacionais vinculadas aos planos"},
+            {"label": "Em risco de prazo", "value": str(delayed), "detail": "planos com desvio frente ao prazo base"},
+            {"label": "Progresso medio", "value": f"{avg_progress}%", "detail": "media composta entre tarefas e calendario"},
+        ]
+
+    @rx.var(cache=False)
     def actions_todo(self) -> list[dict[str, Any]]:
-        return [a for a in self.action_plans_data if a["status"] == "a_fazer"]
+        return [a for a in self.action_plan_tasks_data if a["status"] == "a_fazer"]
 
     @rx.var(cache=False)
     def actions_doing(self) -> list[dict[str, Any]]:
-        return [a for a in self.action_plans_data if a["status"] == "em_andamento"]
+        return [a for a in self.action_plan_tasks_data if a["status"] == "em_andamento"]
 
     @rx.var(cache=False)
     def actions_done(self) -> list[dict[str, Any]]:
-        return [a for a in self.action_plans_data if a["status"] == "concluido"]
+        return [a for a in self.action_plan_tasks_data if a["status"] == "concluido"]
 
     @rx.var(cache=False)
     def ai_documents_data(self) -> list[dict[str, str]]:
@@ -3108,13 +4318,17 @@ class State(SessionStateMixin):
                 "id": str(row.id),
                 "file_name": row.file_name,
                 "resource_type": row.resource_type or "politica",
-                "project_scope": "Base SmartLab" if row.knowledge_scope == "smartlab" else ("Projeto atual" if row.project_id else "Tenant"),
-                "knowledge_scope": row.knowledge_scope or "tenant",
+                "project_scope": self._ai_document_scope_label(row.knowledge_scope, row.project_id),
+                "knowledge_scope": (
+                    "default"
+                    if self._is_default_knowledge_scope(row.knowledge_scope)
+                    else ("group" if str(row.knowledge_scope or "").strip().lower() == "group" else "tenant")
+                ),
                 "uploaded_by": row.uploaded_by or "-",
-                "uploaded_at": row.uploaded_at.strftime("%Y-%m-%d %H:%M") if row.uploaded_at else "-",
+                "uploaded_at": _format_display_datetime(row.uploaded_at),
                 "file_size": f"{max(int(row.file_size or 0) // 1024, 1)} KB" if int(row.file_size or 0) > 0 else "-",
                 "chunk_count": str(chunk_counts.get(int(row.id), 0)),
-                "can_delete": bool(row.knowledge_scope != "smartlab" or self.user_scope == "smartlab"),
+                "can_delete": bool(not self._is_default_knowledge_scope(row.knowledge_scope) or self.user_scope == "smartlab"),
             }
             for row in rows
         ]
@@ -3125,13 +4339,18 @@ class State(SessionStateMixin):
     def ai_context_summary(self) -> dict[str, str]:
         session = SessionLocal()
         target_tenant = self.selected_project_source_tenant if self.ai_scope_mode_effective == "projeto" else self.current_tenant
+        group_tenant_ids = sorted(self._group_tenant_ids_for_tenant(session, target_tenant))
         forms_count = session.query(FormModel).filter(FormModel.tenant_id == target_tenant).count()
         tenant_documents_count = session.query(AssistantDocumentModel).filter(
             AssistantDocumentModel.tenant_id == target_tenant,
             AssistantDocumentModel.knowledge_scope == "tenant",
         ).count()
-        smartlab_documents_count = session.query(AssistantDocumentModel).filter(
-            AssistantDocumentModel.knowledge_scope == "smartlab"
+        group_documents_count = session.query(AssistantDocumentModel).filter(
+            AssistantDocumentModel.tenant_id.in_(group_tenant_ids),
+            AssistantDocumentModel.knowledge_scope == "group",
+        ).count()
+        default_documents_count = session.query(AssistantDocumentModel).filter(
+            self._default_knowledge_scope_filter()
         ).count()
         tenant_chunk_document_ids = [
             int(row[0])
@@ -3140,13 +4359,20 @@ class State(SessionStateMixin):
                 AssistantDocumentModel.knowledge_scope == "tenant",
             ).all()
         ]
-        smartlab_chunk_document_ids = [
+        group_chunk_document_ids = [
             int(row[0])
             for row in session.query(AssistantDocumentModel.id).filter(
-                AssistantDocumentModel.knowledge_scope == "smartlab"
+                AssistantDocumentModel.tenant_id.in_(group_tenant_ids),
+                AssistantDocumentModel.knowledge_scope == "group",
             ).all()
         ]
-        chunk_document_ids = list({*tenant_chunk_document_ids, *smartlab_chunk_document_ids})
+        default_chunk_document_ids = [
+            int(row[0])
+            for row in session.query(AssistantDocumentModel.id).filter(
+                self._default_knowledge_scope_filter()
+            ).all()
+        ]
+        chunk_document_ids = list({*tenant_chunk_document_ids, *group_chunk_document_ids, *default_chunk_document_ids})
         chunk_count = 0
         if chunk_document_ids:
             chunk_count = session.query(AssistantChunkModel).filter(AssistantChunkModel.document_id.in_(chunk_document_ids)).count()
@@ -3170,15 +4396,17 @@ class State(SessionStateMixin):
         return {
             "tenant": target_tenant,
             "scope": self.ai_scope_mode_effective,
-            "documents": str(tenant_documents_count + smartlab_documents_count),
+            "documents": str(tenant_documents_count + group_documents_count + default_documents_count),
             "tenant_documents": str(tenant_documents_count),
-            "smartlab_documents": str(smartlab_documents_count),
+            "group_documents": str(group_documents_count),
+            "default_documents": str(default_documents_count),
             "chunks": str(chunk_count),
             "forms": str(forms_count),
             "interviews": str(len(interviews)),
             "responses": str(responses_count),
             "actions_total": str(actions_total),
             "actions_open": str(actions_open),
+            "group_tenants": ", ".join(group_tenant_ids),
         }
 
     @rx.var(cache=False)
@@ -3199,6 +4427,15 @@ class State(SessionStateMixin):
         responses = query_responses.all()
         user_rows = session.query(UserModel).all()
         client_rows = session.query(ClientModel).all()
+        question_ids = sorted({int(row.question_id) for row in responses if row.question_id is not None})
+        question_dimension_lookup: dict[int, str] = {}
+        if question_ids:
+            question_dimension_lookup = {
+                int(question_id): str(dimension or "Sem dimensão")
+                for question_id, dimension in session.query(QuestionModel.id, QuestionModel.dimension)
+                .filter(QuestionModel.id.in_(question_ids))
+                .all()
+            }
         user_lookup = {int(row.id): row.name for row in user_rows}
         user_client_lookup = {int(row.id): str(row.client_id) if row.client_id is not None else "" for row in user_rows}
         client_lookup = {str(row.id): row.trade_name or row.name for row in client_rows}
@@ -3208,6 +4445,8 @@ class State(SessionStateMixin):
         interview_status_counts: dict[str, int] = {}
         interview_company_counts: dict[str, int] = {}
         interview_company_status_map: dict[str, set[str]] = {}
+        dimension_totals: dict[str, int] = {}
+        dimension_counts: dict[str, int] = {}
         completed_interviewees: list[str] = []
         completed_companies: set[str] = set()
         for interview in interviews:
@@ -3240,6 +4479,10 @@ class State(SessionStateMixin):
             respondent_counts[name] = respondent_counts.get(name, 0) + 1
             company_counts[client_name] = company_counts.get(client_name, 0) + 1
             company_respondent_map.setdefault(client_name, set()).add(name)
+            dimension = question_dimension_lookup.get(int(row.question_id), "Sem dimensão") if row.question_id is not None else "Sem dimensão"
+            score = int(row.score or 0) if row.score is not None else 0
+            dimension_totals[dimension] = dimension_totals.get(dimension, 0) + score
+            dimension_counts[dimension] = dimension_counts.get(dimension, 0) + 1
         interview_names = [row.interviewee_name for row in interviews if row.interviewee_name]
         session.close()
         top_respondents = [
@@ -3262,6 +4505,18 @@ class State(SessionStateMixin):
             }
             for name, count in sorted(interview_company_counts.items(), key=lambda item: (-item[1], item[0]))
         ]
+        dimension_breakdown = []
+        for dimension, total_score in sorted(dimension_totals.items(), key=lambda item: item[0]):
+            count = dimension_counts.get(dimension, 0)
+            average = round(total_score / count, 2) if count else 0.0
+            dimension_breakdown.append(
+                {
+                    "dimension": dimension,
+                    "average": f"{average:.2f}",
+                    "responses": str(count),
+                    "maturity": _dimension_maturity_label(int(round(average))),
+                }
+            )
         return {
             "total_responses": len(responses),
             "total_interviews": len(interviews),
@@ -3276,13 +4531,15 @@ class State(SessionStateMixin):
             "completed_interviewees": sorted(completed_interviewees),
             "completed_companies": sorted(completed_companies),
             "interviewee_names": interview_names,
+            "dimension_breakdown": dimension_breakdown,
         }
 
     @rx.var
     def ai_source_snapshot(self) -> list[dict[str, str]]:
         return [
             {"label": "Documentos IA", "value": self.ai_context_summary["documents"], "detail": "PDF, Word, Excel e outros artefatos indexados"},
-            {"label": "Base SmartLab", "value": self.ai_context_summary["smartlab_documents"], "detail": "materiais-mestre compartilhados pela SmartLab"},
+            {"label": "Grupo", "value": self.ai_context_summary["group_documents"], "detail": "materiais compartilhados entre tenants autorizados do mesmo grupo"},
+            {"label": "Workspace default", "value": self.ai_context_summary["default_documents"], "detail": "materiais globais administrados no workspace default"},
             {"label": "Chunks RAG", "value": self.ai_context_summary["chunks"], "detail": "trechos prontos para recuperação contextual"},
             {"label": "Formulários", "value": self.ai_context_summary["forms"], "detail": "instrumentos ativos no tenant"},
             {"label": "Entrevistas", "value": self.ai_context_summary["interviews"], "detail": "sessões vinculadas ao contexto"},
@@ -3290,31 +4547,108 @@ class State(SessionStateMixin):
             {"label": "Planos em aberto", "value": self.ai_context_summary["actions_open"], "detail": "ações ainda não concluídas"},
         ]
 
-    @rx.var
-    def ai_recommended_actions(self) -> list[dict[str, str]]:
-        recommendations: list[dict[str, str]] = []
-        critical_rows = [row for row in self.dashboard_table if row["status"] in {"Crítico", "Moderado"}]
-        for row in critical_rows[:3]:
-            recommendations.append(
+    def refresh_ai_recommendations(self):
+        target_tenant, project_id = self._resolve_ai_target_tenant_and_project()
+        session = SessionLocal()
+        query = (
+            session.query(AssistantRecommendationModel)
+            .filter(
+                AssistantRecommendationModel.tenant_id == target_tenant,
+                AssistantRecommendationModel.status == "open",
+            )
+            .order_by(AssistantRecommendationModel.created_at.desc(), AssistantRecommendationModel.id.desc())
+        )
+        if project_id is not None:
+            query = query.filter(AssistantRecommendationModel.project_id == project_id)
+        rows = query.all()
+        session.close()
+        self.ai_recommendation_items = [
+            {
+                "id": f"ai-rec-{row.id}",
+                "db_id": str(row.id),
+                "title": str(row.title or ""),
+                "owner": str(row.owner or ""),
+                "due_date": str(row.due_date or ""),
+                "expected_result": str(row.expected_result or ""),
+                "project_id": str(row.project_id) if row.project_id is not None else "",
+                "action_plan_id": "",
+            }
+            for row in rows
+        ]
+        if self.ai_recommendation_editing_id and not any(item["id"] == self.ai_recommendation_editing_id for item in self.ai_recommendation_items):
+            self.ai_recommendation_editing_id = ""
+        if self.ai_recommendation_sending_id and not any(item["id"] == self.ai_recommendation_sending_id for item in self.ai_recommendation_items):
+            self.ai_recommendation_sending_id = ""
+
+    def _project_option_for_id(self, project_id: str) -> str:
+        for item in self.projects_data:
+            if str(item.get("id")) == str(project_id):
+                return f'{item["id"]} - {item["name"]}'
+        return ""
+
+    def _project_source_tenant_by_id(self, project_id: str) -> str:
+        for item in self.projects_data:
+            if str(item.get("id")) == str(project_id):
+                return str(item.get("source_tenant") or self.current_tenant)
+        return self.current_tenant
+
+    def _action_plan_options_for_project(self, project_id: str) -> list[str]:
+        if not str(project_id).isdigit():
+            return []
+        target_tenant = self._project_source_tenant_by_id(project_id)
+        session = SessionLocal()
+        rows = (
+            session.query(ActionPlanModel.id, ActionPlanModel.title)
+            .filter(
+                ActionPlanModel.project_id == int(project_id),
+                ActionPlanModel.tenant_id == target_tenant,
+            )
+            .order_by(ActionPlanModel.title.asc())
+            .all()
+        )
+        session.close()
+        return [f"{row[0]} - {row[1]}" for row in rows]
+
+    @rx.var(cache=False)
+    def ai_recommendation_cards_data(self) -> list[dict[str, Any]]:
+        data: list[dict[str, Any]] = []
+        for item in self.ai_recommendation_items:
+            project_id = str(item.get("project_id") or "")
+            action_plan_id = str(item.get("action_plan_id") or "")
+            action_plan_options = self._action_plan_options_for_project(project_id)
+            selected_plan_option = next(
+                (option for option in action_plan_options if option.split(" - ", 1)[0].strip() == action_plan_id),
+                "",
+            )
+            data.append(
                 {
-                    "title": f"Plano 30-60-90 para {row['form']}",
-                    "owner": "Liderança do processo",
-                    "due_date": "30 dias",
-                    "expected_result": (
-                        f"Elevar a categoria {row['categoria']} acima de {row['media']} com base em políticas, entrevistas e evidências do tenant."
-                    ),
+                    "id": str(item["id"]),
+                    "title": str(item["title"]),
+                    "owner": str(item["owner"]),
+                    "due_date": str(item["due_date"]),
+                    "expected_result": str(item["expected_result"]),
+                    "project_id": project_id,
+                    "project_option": self._project_option_for_id(project_id),
+                    "action_plan_id": action_plan_id,
+                    "action_plan_option": selected_plan_option,
+                    "action_plan_options": action_plan_options,
+                    "is_editing": bool(str(item["id"]) == self.ai_recommendation_editing_id),
+                    "is_sending": bool(str(item["id"]) == self.ai_recommendation_sending_id),
                 }
             )
-        if not recommendations:
-            recommendations.append(
-                {
-                    "title": "Revisar aderência entre políticas e respostas",
-                    "owner": "Consultoria SmartLab",
-                    "due_date": "15 dias",
-                    "expected_result": "Consolidar lacunas, conflitos e ausências documentais antes da próxima rodada de entrevistas.",
-                }
-            )
-        return recommendations
+        return data
+
+    @rx.var(cache=False)
+    def ai_recommendation_active_action_plan_options(self) -> list[str]:
+        if not self.ai_recommendation_sending_id:
+            return []
+        item = next(
+            (row for row in self.ai_recommendation_items if str(row.get("id")) == self.ai_recommendation_sending_id),
+            None,
+        )
+        if not item:
+            return []
+        return self._action_plan_options_for_project(str(item.get("project_id") or ""))
 
     @rx.var
     def ai_history_data(self) -> list[dict[str, str]]:
@@ -3481,35 +4815,152 @@ class State(SessionStateMixin):
 
     @rx.var
     def role_template_options(self) -> list[str]:
-        return list(ROLE_TEMPLATE_CATALOG.keys())
+        return [*ROLE_TEMPLATE_OPTION_KEYS, *self.custom_role_template_keys]
 
     @rx.var(cache=False)
-    def role_templates_data(self) -> list[dict[str, Any]]:
-        if not self.has_valid_permission_principal:
-            return []
-        key = self.selected_role_template_key
-        value = ROLE_TEMPLATE_CATALOG.get(key, ROLE_TEMPLATE_CATALOG["viewer"])
+    def custom_role_templates_data(self) -> list[dict[str, Any]]:
+        session = SessionLocal()
+        rows = (
+            session.query(RoleModel)
+            .filter(RoleModel.tenant_id == self.current_tenant)
+            .order_by(RoleModel.name.asc())
+            .all()
+        )
+        responsibility_rows = (
+            session.query(ResponsibilityModel.role_id, ResponsibilityModel.description)
+            .filter(ResponsibilityModel.tenant_id == self.current_tenant)
+            .order_by(ResponsibilityModel.id.asc())
+            .all()
+        )
+        session.close()
+        responsibility_map: dict[int, list[str]] = {}
+        for role_id, description in responsibility_rows:
+            if role_id is None or not description:
+                continue
+            responsibility_map.setdefault(int(role_id), []).append(str(description))
         return [
             {
-                "key": key,
-                "label": value["label"],
-                "scope": value["scope"],
-                "description": value["description"],
-                "permissions": value["permissions"],
-                "permissions_str": ", ".join(value["permissions"]) if value["permissions"] else "Somente leitura",
+                "id": row.id,
+                "key": row.name,
+                "label": row.name,
+                "scope": "smartlab" if self.current_tenant == "default" else "cliente",
+                "workspace_label": self.current_tenant,
+                "description": "Papel local criado no tenant atual para operacao e governanca daquele workspace.",
+                "permissions": _loads_json(row.permissions, []),
+                "permissions_str": ", ".join(_loads_json(row.permissions, [])) or "Sem permissoes configuradas",
+                "responsibilities": responsibility_map.get(int(row.id), []),
+                "responsibilities_str": "\n".join(responsibility_map.get(int(row.id), [])) or "-",
             }
+            for row in rows
+            if (row.name or "").strip() and row.name not in ROLE_TEMPLATE_OPTION_KEYS
         ]
 
     @rx.var(cache=False)
+    def custom_role_template_keys(self) -> list[str]:
+        return [item["key"] for item in self.custom_role_templates_data]
+
+    @rx.var
+    def role_template_display_options(self) -> list[str]:
+        return [
+            f'{item["label"]} - {item["context_label"]} - {item["workspace_label"]}'
+            for item in self.role_templates_data
+        ]
+
+    @rx.var
+    def selected_role_template_option(self) -> str:
+        key = self.selected_role_template_key
+        row = next((item for item in self.role_templates_data if item["key"] == key), None)
+        if row:
+            return f'{row["label"]} - {row["context_label"]} - {row["workspace_label"]}'
+        if key in ROLE_TEMPLATE_CATALOG:
+            template = ROLE_TEMPLATE_CATALOG.get(key, ROLE_TEMPLATE_CATALOG["smartlab_viewer"])
+            context_label = "SmartLab" if template["scope"] == "smartlab" else "Cliente"
+            return f'{template["label"]} - {context_label} - default'
+        return key
+
+    @rx.var(cache=False)
+    def role_templates_data(self) -> list[dict[str, Any]]:
+        session = SessionLocal()
+        base_rows = (
+            session.query(RoleModel)
+            .filter(RoleModel.tenant_id == "default", RoleModel.name.in_(ROLE_TEMPLATE_OPTION_KEYS))
+            .all()
+        )
+        responsibility_rows = (
+            session.query(ResponsibilityModel.role_id, ResponsibilityModel.description)
+            .filter(ResponsibilityModel.tenant_id == "default")
+            .order_by(ResponsibilityModel.id.asc())
+            .all()
+        )
+        session.close()
+        base_row_map = {str(row.name): row for row in base_rows if (row.name or "").strip()}
+        responsibility_map: dict[int, list[str]] = {}
+        for role_id, description in responsibility_rows:
+            if role_id is None or not description:
+                continue
+            responsibility_map.setdefault(int(role_id), []).append(str(description))
+        base_data = []
+        for key in ROLE_TEMPLATE_OPTION_KEYS:
+            value = ROLE_TEMPLATE_CATALOG[key]
+            row = base_row_map.get(key)
+            permissions = _loads_json(row.permissions, []) if row else value["permissions"]
+            responsibilities = responsibility_map.get(int(row.id), []) if row else []
+            base_data.append(
+                {
+                    "id": row.id if row else "",
+                    "key": key,
+                    "label": value["label"],
+                    "scope": value["scope"],
+                    "context_label": "SmartLab" if value["scope"] == "smartlab" else "Cliente",
+                    "workspace_label": "default",
+                    "reach_label": "Plataforma",
+                    "description": value["description"],
+                    "permissions": permissions,
+                    "permissions_str": ", ".join(permissions) if permissions else "Somente leitura",
+                    "responsibilities": responsibilities,
+                    "responsibilities_str": "\n".join(responsibilities) or "-",
+                    "origin": "global",
+                    "origin_label": "default",
+                    "governance": "Governado pela SmartLab no workspace central da plataforma.",
+                    "can_edit": self.can_manage_global_role_templates,
+                    "can_delete": False,
+                }
+            )
+        custom_data = [
+            {
+                **item,
+                "origin": "tenant",
+                "context_label": "SmartLab" if item.get("scope") == "smartlab" else "Cliente",
+                "workspace_label": self.current_tenant,
+                "reach_label": "Tenant",
+                "origin_label": self.current_tenant,
+                "governance": "Governado no workspace atual, sempre dentro das permissões liberadas pela SmartLab.",
+                "can_edit": self.can_manage_roles,
+                "can_delete": self.can_delete_roles,
+            }
+            for item in self.custom_role_templates_data
+        ]
+        return [*base_data, *custom_data]
+
+    @rx.var(cache=False)
     def selected_role_template_key(self) -> str:
-        if not self.has_valid_permission_principal:
-            return "viewer"
-        if self.perm_selected_role_template in ROLE_TEMPLATE_CATALOG:
+        default_key = "cliente_viewer" if self.selected_access_principal["scope"] == "cliente" else "smartlab_viewer"
+        if self.perm_selected_role_template in ROLE_TEMPLATE_OPTION_KEYS:
             return self.perm_selected_role_template
+        if self.perm_selected_role_template in self.custom_role_template_keys:
+            return self.perm_selected_role_template
+        if self.perm_selected_role_template in ROLE_TEMPLATE_ALIASES:
+            return ROLE_TEMPLATE_ALIASES[self.perm_selected_role_template]
+        if not self.has_valid_permission_principal:
+            return default_key
         principal_role = self.selected_access_principal["role"]
-        if principal_role in ROLE_TEMPLATE_CATALOG:
+        if principal_role in ROLE_TEMPLATE_OPTION_KEYS:
             return principal_role
-        return "viewer"
+        if principal_role in self.custom_role_template_keys:
+            return principal_role
+        if principal_role in ROLE_TEMPLATE_ALIASES:
+            return ROLE_TEMPLATE_ALIASES[principal_role]
+        return default_key
 
     @rx.var(cache=False)
     def selected_role_template_data(self) -> dict[str, Any]:
@@ -3517,27 +4968,54 @@ class State(SessionStateMixin):
             return {
                 "label": "Nenhum usuario selecionado",
                 "scope": "-",
+                "context_label": "-",
+                "reach_label": "-",
+                "origin_label": "-",
+                "workspace_label": "-",
                 "description": "Selecione uma conta valida deste tenant para visualizar o template RBAC.",
                 "permissions_str": "-",
+                "governance": "-",
             }
-        template = ROLE_TEMPLATE_CATALOG.get(self.selected_role_template_key, ROLE_TEMPLATE_CATALOG["viewer"])
+        template_row = next(
+            (item for item in self.role_templates_data if item["key"] == self.selected_role_template_key),
+            None,
+        )
+        if template_row:
+            return {
+                "label": template_row["label"],
+                "scope": template_row["scope"],
+                "context_label": template_row.get("context_label", template_row["scope"]),
+                "reach_label": template_row.get("reach_label", "Tenant"),
+                "origin_label": template_row.get("origin_label", "-"),
+                "workspace_label": template_row.get("workspace_label", template_row.get("origin_label", "-")),
+                "description": template_row["description"],
+                "permissions_str": template_row["permissions_str"],
+                "governance": template_row.get("governance", "-"),
+            }
+        template = ROLE_TEMPLATE_CATALOG.get(self.selected_role_template_key, ROLE_TEMPLATE_CATALOG["smartlab_viewer"])
         return {
             "label": template["label"],
             "scope": template["scope"],
+            "context_label": "SmartLab" if template["scope"] == "smartlab" else "Cliente",
+            "reach_label": "Plataforma",
+            "origin_label": "default",
+            "workspace_label": "default",
             "description": template["description"],
             "permissions_str": ", ".join(template["permissions"]) if template["permissions"] else "Somente leitura",
+            "governance": "Governado pela SmartLab no workspace central da plataforma.",
         }
 
     @rx.var(cache=False)
     def permission_decision_map(self) -> dict[str, str]:
-        mapping: dict[str, str] = {}
         email = (self.perm_user_email or "").strip().lower()
         if not email or not self.has_valid_permission_principal:
-            return mapping
-        for item in self.permission_boxes_data:
-            if item["user_email"] == email:
-                mapping[item["resource"]] = item["decision"]
-        return mapping
+            return {}
+        return self._effective_permission_decisions_for(
+            email,
+            self.selected_role_template_key,
+            str(self.selected_role_template_data.get("scope", "")),
+            self.current_tenant,
+        )
 
     @rx.var(cache=False)
     def permission_canvas_available(self) -> list[dict[str, str]]:
@@ -3717,7 +5195,7 @@ class State(SessionStateMixin):
         rows = query.order_by(TenantModel.name.asc()).all()
         session.close()
         for row in rows:
-            label = "SmartLab - interno" if row.id == "default" else f"{row.name} - cliente"
+            label = self._workspace_label(str(row.id), str(row.name or ""))
             if label == value:
                 self.switch_tenant(row.id)
                 return
@@ -3855,7 +5333,7 @@ class State(SessionStateMixin):
         self.new_user_reports_to_user_id = value.split(" - ", 1)[0].strip()
 
     def set_new_user_workspace_option(self, value: str):
-        self.new_user_tenant_id = value.split(" - ", 1)[0].strip()
+        self.new_user_tenant_id = value.strip()
 
     def toggle_new_user_assigned_client(self, client_id: str):
         current = list(self.new_user_assigned_client_ids)
@@ -3910,7 +5388,7 @@ class State(SessionStateMixin):
         self.new_user_name = ""
         self.new_user_email = ""
         self.new_user_password = ""
-        self.new_user_role = "viewer"
+        self.new_user_role = "sem_acesso"
         self.new_user_scope = "smartlab"
         self.new_user_client_id = ""
         self.new_user_tenant_id = "default"
@@ -3933,8 +5411,13 @@ class State(SessionStateMixin):
 
     def reset_role_form(self):
         self.editing_role_id = ""
+        self.editing_role_template_key = ""
+        self.editing_role_template_origin = ""
         self.new_role_name = ""
-        self.new_role_permissions = "create:clientes,edit:clientes"
+        self.new_role_permissions = ""
+        self.new_role_responsibilities = ""
+        self.role_permission_module_filter = "Todos"
+        self.role_permission_choice = "create:users"
 
     def reset_resp_form(self):
         self.editing_resp_id = ""
@@ -4014,7 +5497,7 @@ class State(SessionStateMixin):
         self.new_user_name = row.name or ""
         self.new_user_email = row.email or ""
         self.new_user_password = ""
-        self.new_user_role = row.role or "viewer"
+        self.new_user_role = row.role or "sem_acesso"
         self.new_user_scope = row.account_scope or "smartlab"
         self.new_user_client_id = str(row.client_id or "")
         self.new_user_tenant_id = row.tenant_id or "default"
@@ -4058,14 +5541,176 @@ class State(SessionStateMixin):
     def start_edit_role(self, role_id: int):
         session = SessionLocal()
         row = session.query(RoleModel).filter(RoleModel.id == role_id, RoleModel.tenant_id == self.current_tenant).first()
-        session.close()
         if not row:
+            session.close()
             self.toast_message = "Papel nao encontrado"
             self.toast_type = "error"
             return
+        responsibility_rows = (
+            session.query(ResponsibilityModel.description)
+            .filter(
+                ResponsibilityModel.tenant_id == self.current_tenant,
+                ResponsibilityModel.role_id == row.id,
+            )
+            .order_by(ResponsibilityModel.id.asc())
+            .all()
+        )
+        session.close()
         self.editing_role_id = str(row.id)
         self.new_role_name = row.name or ""
         self.new_role_permissions = ", ".join(_loads_json(row.permissions, []))
+        self.new_role_responsibilities = "\n".join(
+            str(item[0]).strip()
+            for item in responsibility_rows
+            if item and str(item[0]).strip()
+        )
+        self.role_permission_module_filter = "Todos"
+        available = self.available_role_permission_choices
+        self.role_permission_choice = available[0] if available else ""
+
+    def start_edit_role_template(self, role_key: str):
+        target = next((item for item in self.role_templates_data if item["key"] == role_key), None)
+        if not target:
+            self.toast_message = "Template RBAC nao encontrado"
+            self.toast_type = "error"
+            return
+        if not bool(target.get("can_edit")):
+            self.toast_message = "Sem permissao para editar esta linha"
+            self.toast_type = "error"
+            return
+        self.editing_role_template_key = str(target["key"])
+        self.editing_role_template_origin = str(target.get("origin", "tenant"))
+        self.editing_role_id = str(target.get("id", "") or "")
+        self.new_role_name = str(target["label"] if target.get("origin") == "global" else target["key"])
+        self.new_role_permissions = ", ".join(target.get("permissions", []))
+        responsibilities_str = str(target.get("responsibilities_str", "-"))
+        self.new_role_responsibilities = "" if responsibilities_str == "-" else responsibilities_str
+        self.role_permission_module_filter = "Todos"
+        available = self.available_role_permission_choices
+        self.role_permission_choice = available[0] if available else ""
+
+    def save_role_template_row(self):
+        if not self.can_manage_roles:
+            self.toast_message = "Sem permissão para salvar papéis"
+            self.toast_type = "error"
+            return
+        role_key = self.editing_role_template_key.strip()
+        role_origin = self.editing_role_template_origin.strip() or "tenant"
+        if not role_key:
+            self.create_role()
+            return
+        perms = sorted({p.strip() for p in self.new_role_permissions.split(",") if p.strip()})
+        responsibilities = [
+            line.strip()
+            for line in self.new_role_responsibilities.splitlines()
+            if line.strip()
+        ]
+        if not perms:
+            self.toast_message = "Selecione pelo menos uma permissao para o papel"
+            self.toast_type = "error"
+            return
+        session = SessionLocal()
+        if role_origin == "global":
+            if not self.can_manage_global_role_templates:
+                session.close()
+                self.toast_message = "Apenas perfis autorizados no workspace default podem alterar este template"
+                self.toast_type = "error"
+                return
+            row = (
+                session.query(RoleModel)
+                .filter(RoleModel.tenant_id == "default", RoleModel.name == role_key)
+                .first()
+            )
+            if not row:
+                row = RoleModel(
+                    tenant_id="default",
+                    name=role_key,
+                    permissions=json.dumps(perms),
+                )
+                session.add(row)
+                session.flush()
+            else:
+                row.permissions = json.dumps(perms)
+            role_id = int(row.id)
+            target_tenant = "default"
+        else:
+            role_name = self.new_role_name.strip() or role_key
+            if role_name in ROLE_TEMPLATE_OPTION_KEYS:
+                session.close()
+                self.toast_message = "Esse nome e reservado para templates globais da SmartLab"
+                self.toast_type = "error"
+                return
+            if self.editing_role_id.isdigit():
+                row = (
+                    session.query(RoleModel)
+                    .filter(RoleModel.id == int(self.editing_role_id), RoleModel.tenant_id == self.current_tenant)
+                    .first()
+                )
+                if not row:
+                    session.close()
+                    self.toast_message = "Papel nao encontrado para edicao"
+                    self.toast_type = "error"
+                    return
+                duplicate = (
+                    session.query(RoleModel.id)
+                    .filter(
+                        RoleModel.tenant_id == self.current_tenant,
+                        RoleModel.name == role_name,
+                        RoleModel.id != int(self.editing_role_id),
+                    )
+                    .first()
+                )
+                if duplicate:
+                    session.close()
+                    self.toast_message = "Ja existe um papel com esse nome neste tenant"
+                    self.toast_type = "error"
+                    return
+                row.name = role_name
+                row.permissions = json.dumps(perms)
+            else:
+                duplicate = (
+                    session.query(RoleModel.id)
+                    .filter(
+                        RoleModel.tenant_id == self.current_tenant,
+                        RoleModel.name == role_name,
+                    )
+                    .first()
+                )
+                if duplicate:
+                    session.close()
+                    self.toast_message = "Ja existe um papel com esse nome neste tenant"
+                    self.toast_type = "error"
+                    return
+                row = RoleModel(
+                    tenant_id=self.current_tenant,
+                    name=role_name,
+                    permissions=json.dumps(perms),
+                )
+                session.add(row)
+                session.flush()
+            role_id = int(row.id)
+            target_tenant = self.current_tenant
+        (
+            session.query(ResponsibilityModel)
+            .filter(
+                ResponsibilityModel.tenant_id == target_tenant,
+                ResponsibilityModel.role_id == role_id,
+            )
+            .delete()
+        )
+        for description in responsibilities:
+            session.add(
+                ResponsibilityModel(
+                    tenant_id=target_tenant,
+                    role_id=role_id,
+                    description=description,
+                )
+            )
+        session.commit()
+        session.close()
+        self.reset_role_form()
+        self.toast_message = "Template RBAC atualizado"
+        self.toast_type = "success"
 
     def start_edit_responsibility(self, resp_id: int):
         session = SessionLocal()
@@ -4176,6 +5821,42 @@ class State(SessionStateMixin):
 
     def set_new_role_permissions(self, value: str):
         self.new_role_permissions = value
+
+    def set_new_role_responsibilities(self, value: str):
+        self.new_role_responsibilities = value
+
+    def set_role_permission_module_filter(self, value: str):
+        self.role_permission_module_filter = value
+        available = self.available_role_permission_choices
+        if available:
+            self.role_permission_choice = available[0]
+        else:
+            self.role_permission_choice = ""
+
+    def set_role_permission_choice(self, value: str):
+        self.role_permission_choice = value
+
+    def add_role_permission_choice(self):
+        token = self.role_permission_choice.split(" - ", 1)[0].strip() if self.role_permission_choice else ""
+        self.add_role_permission_token(token)
+
+    def add_role_permission_token(self, token: str):
+        if not token:
+            self.toast_message = "Selecione uma permissao para adicionar ao papel"
+            self.toast_type = "error"
+            return
+        permissions = list(self.selected_role_permissions)
+        if token not in permissions:
+            permissions.append(token)
+        self.new_role_permissions = ",".join(permissions)
+        self.toast_message = "Permissao adicionada ao papel"
+        self.toast_type = "success"
+
+    def remove_role_permission_choice(self, token: str):
+        permissions = [item for item in self.selected_role_permissions if item != token]
+        self.new_role_permissions = ",".join(permissions)
+        self.toast_message = "Permissao removida do papel"
+        self.toast_type = "success"
 
     def set_new_resp_role_id(self, value: str):
         self.new_resp_role_id = value
@@ -4410,10 +6091,123 @@ class State(SessionStateMixin):
         self.ai_resource_type = value
 
     def set_ai_knowledge_scope(self, value: str):
-        self.ai_knowledge_scope = value
+        self.ai_knowledge_scope = "default" if self._is_default_knowledge_scope(value) else "tenant"
 
     def set_ai_scope_mode(self, value: str):
         self.ai_scope_mode = value
+
+    def _update_ai_recommendation_field(self, recommendation_id: str, field_name: str, value: str):
+        updated: list[dict[str, str]] = []
+        for item in self.ai_recommendation_items:
+            if str(item.get("id")) == str(recommendation_id):
+                next_item = dict(item)
+                next_item[field_name] = value
+                if field_name == "project_id":
+                    next_item["action_plan_id"] = ""
+                updated.append(next_item)
+            else:
+                updated.append(item)
+        self.ai_recommendation_items = updated
+
+    def start_edit_ai_recommendation(self, recommendation_id: str):
+        self.ai_recommendation_snapshot = [dict(item) for item in self.ai_recommendation_items]
+        self.ai_recommendation_editing_id = recommendation_id
+        self.ai_recommendation_sending_id = ""
+
+    def save_ai_recommendation_edit(self, recommendation_id: str):
+        item = next((row for row in self.ai_recommendation_items if str(row.get("id")) == str(recommendation_id)), None)
+        if not item:
+            self.toast_message = "Recomendação não encontrada"
+            self.toast_type = "error"
+            return
+        db_id = str(item.get("db_id") or "")
+        if not db_id.isdigit():
+            self.toast_message = "Registro da recomendação inválido"
+            self.toast_type = "error"
+            return
+        session = SessionLocal()
+        row = session.query(AssistantRecommendationModel).filter(AssistantRecommendationModel.id == int(db_id)).first()
+        if not row:
+            session.close()
+            self.toast_message = "Recomendação não encontrada no banco"
+            self.toast_type = "error"
+            return
+        row.title = str(item.get("title") or "").strip() or row.title
+        row.owner = str(item.get("owner") or "").strip()
+        row.due_date = str(item.get("due_date") or "").strip()
+        row.expected_result = str(item.get("expected_result") or "").strip()
+        session.commit()
+        session.close()
+        self.ai_recommendation_snapshot = []
+        self.ai_recommendation_editing_id = ""
+        self.toast_message = "Recomendação atualizada"
+        self.toast_type = "success"
+
+    def cancel_ai_recommendation_edit(self, recommendation_id: str):
+        if self.ai_recommendation_snapshot:
+            self.ai_recommendation_items = [dict(item) for item in self.ai_recommendation_snapshot]
+        self.ai_recommendation_snapshot = []
+        if self.ai_recommendation_editing_id == recommendation_id:
+            self.ai_recommendation_editing_id = ""
+        if self.ai_recommendation_sending_id == recommendation_id:
+            self.ai_recommendation_sending_id = ""
+
+    def delete_ai_recommendation(self, recommendation_id: str):
+        item = next((row for row in self.ai_recommendation_items if str(row.get("id")) == str(recommendation_id)), None)
+        if not item:
+            return
+        db_id = str(item.get("db_id") or "")
+        if db_id.isdigit():
+            session = SessionLocal()
+            row = session.query(AssistantRecommendationModel).filter(AssistantRecommendationModel.id == int(db_id)).first()
+            if row:
+                row.status = "discarded"
+                session.commit()
+            session.close()
+        self.ai_recommendation_items = [row for row in self.ai_recommendation_items if str(row.get("id")) != str(recommendation_id)]
+        if self.ai_recommendation_editing_id == recommendation_id:
+            self.ai_recommendation_editing_id = ""
+        if self.ai_recommendation_sending_id == recommendation_id:
+            self.ai_recommendation_sending_id = ""
+        self.toast_message = "Recomendação descartada"
+        self.toast_type = "success"
+
+    def set_ai_recommendation_title(self, recommendation_id: str, value: str):
+        self._update_ai_recommendation_field(recommendation_id, "title", value)
+
+    def set_ai_recommendation_owner(self, recommendation_id: str, value: str):
+        self._update_ai_recommendation_field(recommendation_id, "owner", value)
+
+    def set_ai_recommendation_due_date(self, recommendation_id: str, value: str):
+        self._update_ai_recommendation_field(recommendation_id, "due_date", value)
+
+    def set_ai_recommendation_expected_result(self, recommendation_id: str, value: str):
+        self._update_ai_recommendation_field(recommendation_id, "expected_result", value)
+
+    def set_ai_recommendation_project_option(self, recommendation_id: str, value: str):
+        project_id = value.split(" - ", 1)[0].strip() if value else ""
+        self._update_ai_recommendation_field(recommendation_id, "project_id", project_id)
+
+    def set_ai_recommendation_action_plan_option(self, recommendation_id: str, value: str):
+        action_plan_id = value.split(" - ", 1)[0].strip() if value else ""
+        self._update_ai_recommendation_field(recommendation_id, "action_plan_id", action_plan_id)
+
+    def open_ai_recommendation_send(self, recommendation_id: str):
+        updated: list[dict[str, str]] = []
+        for item in self.ai_recommendation_items:
+            if str(item.get("id")) != str(recommendation_id):
+                updated.append(item)
+                continue
+            next_item = dict(item)
+            if not str(next_item.get("project_id") or "") and self.selected_project_id:
+                next_item["project_id"] = self.selected_project_id
+            updated.append(next_item)
+        self.ai_recommendation_items = updated
+        self.ai_recommendation_sending_id = recommendation_id
+
+    def cancel_ai_recommendation_send(self, recommendation_id: str):
+        if self.ai_recommendation_sending_id == recommendation_id:
+            self.ai_recommendation_sending_id = ""
 
     def set_audit_filter_scope(self, value: str):
         self.audit_filter_scope = value
@@ -4537,7 +6331,7 @@ class State(SessionStateMixin):
         project.project_type = self.new_project_type
         project.service_name = service_name
         project.client_id = int(self.new_project_client_id)
-        project.contracted_at = self.new_project_contracted_at.strip() or datetime.utcnow().strftime("%Y-%m-%d")
+        project.contracted_at = self.new_project_contracted_at.strip() or _now_brasilia().strftime("%Y-%m-%d")
         assignment = (
             session.query(ProjectAssignmentModel)
             .filter(ProjectAssignmentModel.project_id == int(project.id))
@@ -4564,7 +6358,7 @@ class State(SessionStateMixin):
 
     def delete_project(self, project_id: int):
         if not self.can_configure_projects:
-            self.toast_message = "Projetos so podem ser geridos no SmartLab - interno"
+            self.toast_message = "Projetos so podem ser geridos no workspace default"
             self.toast_type = "error"
             return
         session = SessionLocal()
@@ -4699,6 +6493,18 @@ class State(SessionStateMixin):
     def set_new_box_output_key(self, value: str):
         self.new_box_output_key = value
 
+    def set_new_box_owner(self, value: str):
+        self.new_box_owner = value
+
+    def set_new_box_objective(self, value: str):
+        self.new_box_objective = value
+
+    def set_new_box_trigger(self, value: str):
+        self.new_box_trigger = value
+
+    def set_new_box_expected_output(self, value: str):
+        self.new_box_expected_output = value
+
     def set_new_sticky_note_text(self, value: str):
         self.new_sticky_note_text = value
 
@@ -4707,6 +6513,12 @@ class State(SessionStateMixin):
 
     def set_new_action_owner(self, value: str):
         self.new_action_owner = value
+
+    def set_new_action_start_date(self, value: str):
+        self.new_action_start_date = value
+
+    def set_new_action_planned_due_date(self, value: str):
+        self.new_action_planned_due_date = value
 
     def set_new_action_due_date(self, value: str):
         self.new_action_due_date = value
@@ -4719,6 +6531,204 @@ class State(SessionStateMixin):
 
     def set_new_action_area(self, value: str):
         self.new_action_area = value
+        if self.new_action_owner and self.new_action_owner not in self.project_action_owner_options:
+            self.new_action_owner = ""
+        if self.new_action_task_owner and self.new_action_task_owner not in self.project_action_owner_options:
+            self.new_action_task_owner = ""
+
+    def set_selected_action_plan_option(self, value: str):
+        self.selected_action_plan_id = value.split(" - ", 1)[0].strip() if value else ""
+
+    def toggle_new_action_dimension(self, value: str):
+        current = list(self.new_action_dimension_ids)
+        if value in current:
+            current.remove(value)
+        else:
+            current.append(value)
+        self.new_action_dimension_ids = current
+        self.new_action_dimensions = ", ".join(current)
+
+    def set_new_action_task_title(self, value: str):
+        self.new_action_task_title = value
+
+    def set_new_action_task_owner(self, value: str):
+        self.new_action_task_owner = value
+
+    def set_new_action_task_start_date(self, value: str):
+        self.new_action_task_start_date = value
+
+    def set_new_action_task_planned_due_date(self, value: str):
+        self.new_action_task_planned_due_date = value
+
+    def set_new_action_task_due_date(self, value: str):
+        self.new_action_task_due_date = value
+
+    def set_new_action_task_expected_result(self, value: str):
+        self.new_action_task_expected_result = value
+
+    def set_new_action_task_progress(self, value: str):
+        self.new_action_task_progress = value
+
+    def add_draft_action_task(self):
+        if not self.new_action_task_title.strip():
+            self.toast_message = "Informe o nome da tarefa"
+            self.toast_type = "error"
+            return
+        progress = max(0, min(100, _parse_int(self.new_action_task_progress) or 0))
+        self.draft_action_tasks = self.draft_action_tasks + [
+            {
+                "title": self.new_action_task_title.strip(),
+                "owner": self.new_action_task_owner.strip() or self.new_action_owner.strip() or "Responsavel nao definido",
+                "start_date": self.new_action_task_start_date.strip(),
+                "planned_due_date": self.new_action_task_planned_due_date.strip() or self.new_action_task_due_date.strip(),
+                "due_date": self.new_action_task_due_date.strip() or self.new_action_task_planned_due_date.strip(),
+                "expected_result": self.new_action_task_expected_result.strip(),
+                "progress": str(progress),
+            }
+        ]
+        self.new_action_task_title = ""
+        self.new_action_task_owner = ""
+        self.new_action_task_start_date = ""
+        self.new_action_task_planned_due_date = ""
+        self.new_action_task_due_date = ""
+        self.new_action_task_expected_result = ""
+        self.new_action_task_progress = "0"
+
+    def remove_draft_action_task(self, index: int):
+        self.draft_action_tasks = [item for idx, item in enumerate(self.draft_action_tasks) if idx != int(index)]
+
+    def reset_action_task_form(self):
+        self.new_action_task_title = ""
+        self.new_action_task_owner = ""
+        self.new_action_task_start_date = ""
+        self.new_action_task_planned_due_date = ""
+        self.new_action_task_due_date = ""
+        self.new_action_task_expected_result = ""
+        self.new_action_task_progress = "0"
+
+    def create_action_task(self):
+        plan_id = self.editing_action_plan_id or self.selected_action_plan_id
+        if not str(plan_id).isdigit():
+            self.toast_message = "Selecione ou salve um plano antes de criar tarefas"
+            self.toast_type = "error"
+            return
+        if not self.new_action_task_title.strip():
+            self.toast_message = "Informe a tarefa"
+            self.toast_type = "error"
+            return
+        planned_due_date = self.new_action_task_planned_due_date.strip() or self.new_action_task_due_date.strip()
+        due_date = self.new_action_task_due_date.strip() or planned_due_date
+        progress = 0
+        session = SessionLocal()
+        row = (
+            session.query(ActionTaskModel)
+            .filter(
+                ActionTaskModel.tenant_id == self.selected_project_source_tenant,
+                ActionTaskModel.action_plan_id == int(plan_id),
+            )
+            .count()
+        )
+        plan_title = str(plan_row.title or "Plano")
+        session.add(
+            ActionTaskModel(
+                tenant_id=self.selected_project_source_tenant,
+                action_plan_id=int(plan_id),
+                title=self.new_action_task_title.strip(),
+                owner=self.new_action_task_owner.strip() or self.new_action_owner.strip() or "Responsavel nao definido",
+                start_date=self.new_action_task_start_date.strip(),
+                planned_due_date=planned_due_date,
+                due_date=due_date,
+                due_date_change_count=0,
+                expected_result=self.new_action_task_expected_result.strip(),
+                progress=progress,
+            )
+        )
+        session.commit()
+        session.close()
+        self.reset_action_task_form()
+        self.toast_message = "Tarefa criada e enviada para A Fazer"
+        self.toast_type = "success"
+
+    def toggle_action_plan_expanded(self, action_id: int):
+        action_key = str(action_id)
+        current = list(self.expanded_action_plan_ids)
+        if action_key in current:
+            current.remove(action_key)
+        else:
+            current.append(action_key)
+        self.expanded_action_plan_ids = current
+
+    def cancel_edit_action_plan(self):
+        self.editing_action_plan_id = ""
+        self.selected_action_plan_id = ""
+        self.new_action_title = ""
+        self.new_action_owner = ""
+        self.new_action_start_date = ""
+        self.new_action_planned_due_date = ""
+        self.new_action_due_date = ""
+        self.new_action_expected_result = ""
+        self.new_action_dimensions = ""
+        self.new_action_area = ""
+        self.new_action_dimension_ids = []
+        self.new_action_task_title = ""
+        self.new_action_task_owner = ""
+        self.new_action_task_start_date = ""
+        self.new_action_task_planned_due_date = ""
+        self.new_action_task_due_date = ""
+        self.new_action_task_expected_result = ""
+        self.new_action_task_progress = "0"
+        self.draft_action_tasks = []
+
+    def start_edit_action_plan(self):
+        if not self.selected_action_plan_id.isdigit():
+            self.toast_message = "Selecione um plano para alterar"
+            self.toast_type = "error"
+            return
+        session = SessionLocal()
+        row = (
+            session.query(ActionPlanModel)
+            .filter(ActionPlanModel.id == int(self.selected_action_plan_id))
+            .first()
+        )
+        if not row:
+            session.close()
+            self.toast_message = "Plano nao encontrado"
+            self.toast_type = "error"
+            return
+        task_rows = (
+            session.query(ActionTaskModel)
+            .filter(
+                ActionTaskModel.tenant_id == row.tenant_id,
+                ActionTaskModel.action_plan_id == int(row.id),
+            )
+            .order_by(ActionTaskModel.id.asc())
+            .all()
+        )
+        session.close()
+        self.editing_action_plan_id = str(row.id)
+        self.new_action_title = row.title or ""
+        self.new_action_area = row.target_area or ""
+        self.new_action_owner = row.owner or ""
+        self.new_action_start_date = row.start_date or ""
+        self.new_action_planned_due_date = row.planned_due_date or ""
+        self.new_action_due_date = row.due_date or ""
+        self.new_action_expected_result = row.expected_result or ""
+        self.new_action_dimensions = row.dimension_names or ""
+        self.new_action_dimension_ids = [item.strip() for item in str(row.dimension_names or "").split(",") if item.strip()]
+        self.draft_action_tasks = [
+            {
+                "title": task.title,
+                "owner": task.owner,
+                "start_date": task.start_date or "",
+                "planned_due_date": task.planned_due_date or "",
+                "due_date": task.due_date or "",
+                "expected_result": task.expected_result or "",
+                "progress": str(int(task.progress or 0)),
+            }
+            for task in task_rows
+        ]
+        self.toast_message = "Plano carregado para alteracao"
+        self.toast_type = "success"
 
     def set_new_user_client_id(self, value: str):
         self.new_user_client_id = value
@@ -4765,6 +6775,7 @@ class State(SessionStateMixin):
 
     def set_perm_user_email(self, value: str):
         self.perm_user_email = value
+        self.last_reset_user_password = ""
         session = SessionLocal()
         user = (
             session.query(UserModel)
@@ -4774,18 +6785,129 @@ class State(SessionStateMixin):
             )
             .first()
         )
+        custom_role_names = {
+            row[0]
+            for row in session.query(RoleModel.name)
+            .filter(RoleModel.tenant_id == self.current_tenant)
+            .all()
+            if row[0]
+        }
         session.close()
-        if user and (user.role or "") in ROLE_TEMPLATE_CATALOG:
-            self.perm_selected_role_template = user.role or "viewer"
+        if user and ((user.role or "") in ROLE_TEMPLATE_CATALOG or (user.role or "") in custom_role_names):
+            self.perm_selected_role_template = user.role or "smartlab_viewer"
         else:
-            self.perm_selected_role_template = "viewer"
+            self.perm_selected_role_template = "smartlab_viewer"
         self.perm_selected_module = "Todos"
 
     def set_perm_selected_module(self, value: str):
         self.perm_selected_module = value
 
+    def set_permissions_tab(self, value: str):
+        self.permissions_tab = value or "governanca"
+
     def set_perm_selected_role_template(self, value: str):
-        self.perm_selected_role_template = value
+        if not value:
+            self.perm_selected_role_template = "smartlab_viewer"
+            return
+        selected = next(
+            (
+                item for item in self.role_templates_data
+                if f'{item["label"]} - {item["context_label"]} - {item["workspace_label"]}' == value
+            ),
+            None,
+        )
+        if selected:
+            self.perm_selected_role_template = str(selected["key"])
+            return
+        self.perm_selected_role_template = value.split(" - ", 1)[0].strip()
+
+    def apply_selected_role_template(self):
+        if not self.perm_user_email.strip():
+            self.toast_message = "Selecione um usuario para liberar acesso"
+            self.toast_type = "error"
+            return
+        role_key = self.selected_role_template_key
+        session = SessionLocal()
+        user = (
+            session.query(UserModel)
+            .filter(
+                UserModel.tenant_id == self.current_tenant,
+                UserModel.email == self.perm_user_email.strip().lower(),
+            )
+            .first()
+        )
+        if not user:
+            session.close()
+            self.toast_message = "Usuario nao encontrado para liberacao"
+            self.toast_type = "error"
+            return
+        template = ROLE_TEMPLATE_CATALOG.get(role_key)
+        if template:
+            user_scope = user.account_scope or "smartlab"
+            if template["scope"] != user_scope:
+                session.close()
+                self.toast_message = "O template selecionado nao corresponde ao escopo da conta"
+                self.toast_type = "error"
+                return
+        else:
+            custom_role = (
+                session.query(RoleModel)
+                .filter(
+                    RoleModel.tenant_id == self.current_tenant,
+                    RoleModel.name == role_key,
+                )
+                .first()
+            )
+            if not custom_role:
+                session.close()
+                self.toast_message = "Template RBAC invalido"
+                self.toast_type = "error"
+                return
+        user.role = role_key
+        session.commit()
+        session.close()
+        label = template["label"] if template else role_key
+        self.toast_message = f"Acesso base liberado com template {label}"
+        self.toast_type = "success"
+
+    def reset_selected_user_password(self):
+        if not self.can_reset_user_password:
+            self.toast_message = "Sem permissao para resetar senha"
+            self.toast_type = "error"
+            return
+        email = self.perm_user_email.strip().lower()
+        if not email:
+            self.toast_message = "Selecione um usuario antes de resetar a senha"
+            self.toast_type = "error"
+            return
+        session = SessionLocal()
+        user = (
+            session.query(UserModel)
+            .filter(
+                UserModel.tenant_id == self.current_tenant,
+                UserModel.email == email,
+            )
+            .first()
+        )
+        if not user:
+            session.close()
+            self.toast_message = "Usuario nao encontrado para reset de senha"
+            self.toast_type = "error"
+            return
+        temp_password = secrets.token_urlsafe(8)[:12]
+        user.password = temp_password
+        user.must_change_password = 1
+        session.commit()
+        session.close()
+        self.last_reset_user_password = temp_password
+        self._append_audit_entry(
+            "user.password_reset",
+            f"Senha temporaria redefinida para {email}",
+            "security",
+            {"target_user": email},
+        )
+        self.toast_message = "Senha temporaria gerada. Compartilhe com o usuario e exija troca no proximo login."
+        self.toast_type = "success"
 
     def set_new_dashboard_box_title(self, value: str):
         self.new_dashboard_box_title = value
@@ -4984,7 +7106,8 @@ class State(SessionStateMixin):
             if self.new_user_password.strip():
                 user.password = self.new_user_password
                 user.must_change_password = 1 if self.new_user_scope == "cliente" else 0
-            user.role = self.new_user_role
+            if not user.role:
+                user.role = "sem_acesso"
             user.account_scope = self.new_user_scope
             user.client_id = target_client_id if self.new_user_scope == "cliente" else None
             user.profession = profession
@@ -4998,7 +7121,7 @@ class State(SessionStateMixin):
                     name=self.new_user_name.strip(),
                     email=self.new_user_email.strip().lower(),
                     password=self.new_user_password,
-                    role=self.new_user_role,
+                    role="sem_acesso",
                     account_scope=self.new_user_scope,
                     client_id=target_client_id if self.new_user_scope == "cliente" else None,
                     must_change_password=1 if self.new_user_scope == "cliente" else 0,
@@ -5012,7 +7135,11 @@ class State(SessionStateMixin):
         session.commit()
         session.close()
         self.reset_user_form()
-        self.toast_message = "Usuario atualizado" if editing_id is not None else "Usuario criado"
+        self.toast_message = (
+            "Usuario atualizado"
+            if editing_id is not None
+            else "Usuario criado sem acesso. Libere o template e as permissoes na UI Permissoes."
+        )
         self.toast_type = "success"
 
     def delete_user(self, user_id: int):
@@ -5150,8 +7277,27 @@ class State(SessionStateMixin):
             self.toast_message = "Sem permissão para criar papéis"
             self.toast_type = "error"
             return
-        perms = [p.strip() for p in self.new_role_permissions.split(",") if p.strip()]
+        perms = sorted({p.strip() for p in self.new_role_permissions.split(",") if p.strip()})
+        responsibilities = [
+            line.strip()
+            for line in self.new_role_responsibilities.splitlines()
+            if line.strip()
+        ]
+        if not self.new_role_name.strip():
+            self.toast_message = "Informe o nome do papel"
+            self.toast_type = "error"
+            return
+        if not perms:
+            self.toast_message = "Selecione pelo menos uma permissao para o papel"
+            self.toast_type = "error"
+            return
         session = SessionLocal()
+        role_name = self.new_role_name.strip()
+        if role_name in ROLE_TEMPLATE_OPTION_KEYS:
+            session.close()
+            self.toast_message = "Esse nome e reservado para templates globais da SmartLab"
+            self.toast_type = "error"
+            return
         if self.editing_role_id.isdigit():
             row = session.query(RoleModel).filter(RoleModel.id == int(self.editing_role_id), RoleModel.tenant_id == self.current_tenant).first()
             if not row:
@@ -5159,14 +7305,59 @@ class State(SessionStateMixin):
                 self.toast_message = "Papel nao encontrado para edicao"
                 self.toast_type = "error"
                 return
-            row.name = self.new_role_name or "Novo Papel"
+            duplicate = (
+                session.query(RoleModel.id)
+                .filter(
+                    RoleModel.tenant_id == self.current_tenant,
+                    RoleModel.name == role_name,
+                    RoleModel.id != int(self.editing_role_id),
+                )
+                .first()
+            )
+            if duplicate:
+                session.close()
+                self.toast_message = "Ja existe um papel com esse nome neste tenant"
+                self.toast_type = "error"
+                return
+            row.name = role_name
             row.permissions = json.dumps(perms)
+            role_id = int(row.id)
         else:
+            duplicate = (
+                session.query(RoleModel.id)
+                .filter(
+                    RoleModel.tenant_id == self.current_tenant,
+                    RoleModel.name == role_name,
+                )
+                .first()
+            )
+            if duplicate:
+                session.close()
+                self.toast_message = "Ja existe um papel com esse nome neste tenant"
+                self.toast_type = "error"
+                return
+            row = RoleModel(
+                tenant_id=self.current_tenant,
+                name=role_name,
+                permissions=json.dumps(perms),
+            )
+            session.add(row)
+            session.flush()
+            role_id = int(row.id)
+        (
+            session.query(ResponsibilityModel)
+            .filter(
+                ResponsibilityModel.tenant_id == self.current_tenant,
+                ResponsibilityModel.role_id == role_id,
+            )
+            .delete()
+        )
+        for description in responsibilities:
             session.add(
-                RoleModel(
+                ResponsibilityModel(
                     tenant_id=self.current_tenant,
-                    name=self.new_role_name or "Novo Papel",
-                    permissions=json.dumps(perms),
+                    role_id=role_id,
+                    description=description,
                 )
             )
         session.commit()
@@ -5177,13 +7368,26 @@ class State(SessionStateMixin):
         self.toast_type = "success"
 
     def delete_role(self, role_id: int):
-        if "delete:roles" not in ROLE_PERMS.get(self.user_role, set()):
+        if not self.can_delete_roles:
             self.toast_message = "Sem permissão para deletar papéis"
             self.toast_type = "error"
             return
         session = SessionLocal()
         row = session.query(RoleModel).filter(RoleModel.id == role_id, RoleModel.tenant_id == self.current_tenant).first()
+        if row and row.name in ROLE_TEMPLATE_OPTION_KEYS:
+            session.close()
+            self.toast_message = "Templates globais da SmartLab nao podem ser excluidos por esta acao"
+            self.toast_type = "error"
+            return
         if row:
+            (
+                session.query(ResponsibilityModel)
+                .filter(
+                    ResponsibilityModel.tenant_id == self.current_tenant,
+                    ResponsibilityModel.role_id == role_id,
+                )
+                .delete()
+            )
             session.delete(row)
             session.commit()
             self.toast_message = "Papel removido"
@@ -5229,7 +7433,7 @@ class State(SessionStateMixin):
         self.toast_type = "success"
 
     def delete_responsibility(self, resp_id: int):
-        if "delete:responsabilidades" not in ROLE_PERMS.get(self.user_role, set()):
+        if not self.can_delete_resps:
             self.toast_message = "Sem permissão para deletar"
             self.toast_type = "error"
             return
@@ -5326,7 +7530,7 @@ class State(SessionStateMixin):
         self.toast_type = "success"
 
     def delete_form(self, form_id: int):
-        if "delete:forms" not in ROLE_PERMS.get(self.user_role, set()):
+        if not self.can_delete_forms:
             self.toast_message = "Sem permissão para deletar pesquisas"
             self.toast_type = "error"
             return
@@ -5616,7 +7820,7 @@ class State(SessionStateMixin):
             interviewee_user_id=interviewee_user_id,
             target_area=self.new_interview_area.strip() or None,
             audience_group=self.new_interview_group_name.strip() or None,
-            interview_date=self.new_interview_date.strip() or datetime.utcnow().strftime("%Y-%m-%d"),
+            interview_date=self.new_interview_date.strip() or _now_brasilia().strftime("%Y-%m-%d"),
             interviewee_name=interviewee_name,
             interviewee_role=interviewee_role,
             consultant_name=self.login_email.strip().lower() or "consultor@smartlab.com",
@@ -5713,7 +7917,7 @@ class State(SessionStateMixin):
         interview.client_id = int(project.client_id) if project.client_id is not None else None
         interview.survey_id = int(survey.id)
         interview.form_id = int(survey.legacy_form_id or 0)
-        interview.interview_date = self.edit_interview_date.strip() or interview.interview_date or datetime.utcnow().strftime("%Y-%m-%d")
+        interview.interview_date = self.edit_interview_date.strip() or interview.interview_date or _now_brasilia().strftime("%Y-%m-%d")
         interview.status = self.edit_interview_status or "em_andamento"
         session.commit()
         session.close()
@@ -6202,7 +8406,7 @@ class State(SessionStateMixin):
 
     def create_project(self):
         if not self.can_configure_projects:
-            self.toast_message = "Projetos so podem ser configurados no SmartLab - interno"
+            self.toast_message = "Projetos so podem ser configurados no workspace default"
             self.toast_type = "error"
             return
         if not self.new_project_name:
@@ -6219,7 +8423,7 @@ class State(SessionStateMixin):
             self.toast_type = "error"
             return
         project_name = self.new_project_name.strip()
-        contracted_at = self.new_project_contracted_at.strip() or datetime.utcnow().strftime("%Y-%m-%d")
+        contracted_at = self.new_project_contracted_at.strip() or _now_brasilia().strftime("%Y-%m-%d")
         session = SessionLocal()
         duplicate = (
             session.query(ProjectModel)
@@ -6273,7 +8477,7 @@ class State(SessionStateMixin):
 
     def save_project_client_links(self):
         if not self.can_configure_projects:
-            self.toast_message = "Vinculos so podem ser geridos no SmartLab - interno"
+            self.toast_message = "Vinculos so podem ser geridos no workspace default"
             self.toast_type = "error"
             return
         if not self.selected_project_id.isdigit():
@@ -6304,18 +8508,19 @@ class State(SessionStateMixin):
             self.toast_message = "Selecione projeto e nome da caixa"
             self.toast_type = "error"
             return
+        target_tenant = self.selected_project_source_tenant
         session = SessionLocal()
         max_pos = (
             session.query(WorkflowBoxModel)
             .filter(
-                WorkflowBoxModel.tenant_id == self.current_tenant,
+                WorkflowBoxModel.tenant_id == target_tenant,
                 WorkflowBoxModel.project_id == int(self.selected_project_id),
             )
             .count()
         )
         session.add(
             WorkflowBoxModel(
-                tenant_id=self.current_tenant,
+                tenant_id=target_tenant,
                 project_id=int(self.selected_project_id),
                 title=self.new_box_title,
                 box_type=self.new_box_type,
@@ -6323,8 +8528,12 @@ class State(SessionStateMixin):
                 config_json=json.dumps(
                     {
                         "source": "builder",
-                        "timestamp": datetime.utcnow().isoformat(),
+                        "timestamp": _now_brasilia().isoformat(),
                         "zone": self.new_box_zone,
+                        "owner": self.new_box_owner.strip(),
+                        "objective": self.new_box_objective.strip(),
+                        "trigger": self.new_box_trigger.strip(),
+                        "expected_output": self.new_box_expected_output.strip(),
                         "method": self.new_box_method,
                         "endpoint": self.new_box_endpoint.strip(),
                         "retry_policy": self.new_box_retry_policy,
@@ -6348,7 +8557,119 @@ class State(SessionStateMixin):
         self.new_box_client_secret = ""
         self.new_box_condition = ""
         self.new_box_output_key = ""
+        self.new_box_owner = ""
+        self.new_box_objective = ""
+        self.new_box_trigger = ""
+        self.new_box_expected_output = ""
         self.toast_message = "Caixa adicionada ao workflow"
+        self.toast_type = "success"
+
+    def add_workflow_stage_template(self, stage_key: str):
+        if not self.selected_project_id:
+            self.toast_message = "Selecione um projeto"
+            self.toast_type = "error"
+            return
+        template = next((item for item in WORKFLOW_STAGE_LIBRARY if item["key"] == stage_key), None)
+        if not template:
+            self.toast_message = "Etapa sugerida nao encontrada"
+            self.toast_type = "error"
+            return
+        target_tenant = self.selected_project_source_tenant
+        session = SessionLocal()
+        exists = (
+            session.query(WorkflowBoxModel.id)
+            .filter(
+                WorkflowBoxModel.tenant_id == target_tenant,
+                WorkflowBoxModel.project_id == int(self.selected_project_id),
+                WorkflowBoxModel.title == template["title"],
+            )
+            .first()
+        )
+        if exists:
+            session.close()
+            self.toast_message = "Essa etapa ja existe na jornada"
+            self.toast_type = "error"
+            return
+        max_pos = (
+            session.query(WorkflowBoxModel)
+            .filter(
+                WorkflowBoxModel.tenant_id == target_tenant,
+                WorkflowBoxModel.project_id == int(self.selected_project_id),
+            )
+            .count()
+        )
+        session.add(
+            WorkflowBoxModel(
+                tenant_id=target_tenant,
+                project_id=int(self.selected_project_id),
+                title=template["title"],
+                box_type=template["box_type"],
+                position=max_pos + 1,
+                config_json=json.dumps(
+                    {
+                        "source": "journey_template",
+                        "timestamp": _now_brasilia().isoformat(),
+                        "zone": template["zone"],
+                        "owner": template["owner"],
+                        "objective": template["objective"],
+                        "trigger": template["trigger"],
+                        "expected_output": template["expected_output"],
+                    }
+                ),
+            )
+        )
+        session.commit()
+        session.close()
+        self.toast_message = "Etapa sugerida adicionada a jornada"
+        self.toast_type = "success"
+
+    def seed_workflow_journey(self):
+        if not self.selected_project_id:
+            self.toast_message = "Selecione um projeto"
+            self.toast_type = "error"
+            return
+        missing = self.workflow_missing_stage_templates
+        if not missing:
+            self.toast_message = "A jornada sugerida ja esta carregada"
+            self.toast_type = "success"
+            return
+        target_tenant = self.selected_project_source_tenant
+        session = SessionLocal()
+        max_pos = (
+            session.query(WorkflowBoxModel)
+            .filter(
+                WorkflowBoxModel.tenant_id == target_tenant,
+                WorkflowBoxModel.project_id == int(self.selected_project_id),
+            )
+            .count()
+        )
+        for offset, template in enumerate(missing, start=1):
+            full_template = next((item for item in WORKFLOW_STAGE_LIBRARY if item["key"] == template["key"]), None)
+            if not full_template:
+                continue
+            session.add(
+                WorkflowBoxModel(
+                    tenant_id=target_tenant,
+                    project_id=int(self.selected_project_id),
+                    title=full_template["title"],
+                    box_type=full_template["box_type"],
+                    position=max_pos + offset,
+                    config_json=json.dumps(
+                        {
+                            "source": "journey_template",
+                            "timestamp": _now_brasilia().isoformat(),
+                            "zone": full_template["zone"],
+                            "owner": full_template["owner"],
+                            "objective": full_template["objective"],
+                            "trigger": full_template["trigger"],
+                            "expected_output": full_template["expected_output"],
+                        }
+                    ),
+                )
+            )
+        session.commit()
+        session.close()
+        self.toast_message = "Jornada sugerida carregada no projeto"
         self.toast_type = "success"
 
     def add_sticky_note(self):
@@ -6356,18 +8677,19 @@ class State(SessionStateMixin):
             self.toast_message = "Selecione projeto e escreva a anotação"
             self.toast_type = "error"
             return
+        target_tenant = self.selected_project_source_tenant
         session = SessionLocal()
         max_pos = (
             session.query(WorkflowBoxModel)
             .filter(
-                WorkflowBoxModel.tenant_id == self.current_tenant,
+                WorkflowBoxModel.tenant_id == target_tenant,
                 WorkflowBoxModel.project_id == int(self.selected_project_id),
             )
             .count()
         )
         session.add(
             WorkflowBoxModel(
-                tenant_id=self.current_tenant,
+                tenant_id=target_tenant,
                 project_id=int(self.selected_project_id),
                 title="Sticky Note",
                 box_type="nota",
@@ -6377,7 +8699,7 @@ class State(SessionStateMixin):
                         "zone": "right",
                         "note": self.new_sticky_note_text.strip(),
                         "source": "sticky-note",
-                        "timestamp": datetime.utcnow().isoformat(),
+                        "timestamp": _now_brasilia().isoformat(),
                     }
                 ),
             )
@@ -6391,11 +8713,12 @@ class State(SessionStateMixin):
     def move_workflow_box(self, box_id: int, direction: str):
         if not self.selected_project_id:
             return
+        target_tenant = self.selected_project_source_tenant
         session = SessionLocal()
         rows = (
             session.query(WorkflowBoxModel)
             .filter(
-                WorkflowBoxModel.tenant_id == self.current_tenant,
+                WorkflowBoxModel.tenant_id == target_tenant,
                 WorkflowBoxModel.project_id == int(self.selected_project_id),
             )
             .order_by(WorkflowBoxModel.position.asc(), WorkflowBoxModel.id.asc())
@@ -6416,10 +8739,11 @@ class State(SessionStateMixin):
         session.close()
 
     def nudge_workflow_box(self, box_id: int, axis: str, delta: int):
+        target_tenant = self.selected_project_source_tenant
         session = SessionLocal()
         row = (
             session.query(WorkflowBoxModel)
-            .filter(WorkflowBoxModel.id == box_id, WorkflowBoxModel.tenant_id == self.current_tenant)
+            .filter(WorkflowBoxModel.id == box_id, WorkflowBoxModel.tenant_id == target_tenant)
             .first()
         )
         if not row:
@@ -6439,10 +8763,11 @@ class State(SessionStateMixin):
         session.close()
 
     def drop_workflow_box_to_zone(self, box_id: int, zone: str):
+        target_tenant = self.selected_project_source_tenant
         session = SessionLocal()
         row = (
             session.query(WorkflowBoxModel)
-            .filter(WorkflowBoxModel.id == box_id, WorkflowBoxModel.tenant_id == self.current_tenant)
+            .filter(WorkflowBoxModel.id == box_id, WorkflowBoxModel.tenant_id == target_tenant)
             .first()
         )
         if not row:
@@ -6455,12 +8780,13 @@ class State(SessionStateMixin):
         session.close()
 
     def delete_workflow_box(self, box_id: int):
+        target_tenant = self.selected_project_source_tenant
         session = SessionLocal()
         row = (
             session.query(WorkflowBoxModel)
             .filter(
                 WorkflowBoxModel.id == box_id,
-                WorkflowBoxModel.tenant_id == self.current_tenant,
+                WorkflowBoxModel.tenant_id == target_tenant,
             )
             .first()
         )
@@ -6480,91 +8806,156 @@ class State(SessionStateMixin):
             self.toast_type = "error"
             return
 
-        timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-        logs = [f"[{timestamp}] Iniciando execução do workflow do projeto #{self.selected_project_id}"]
-        items = [b for b in self.workflow_boxes_data if b["box_type"] != "nota"]
+        timestamp = _format_display_datetime(_now_brasilia(), include_seconds=True)
+        project = self.selected_project_record
+        logs = [f"[{timestamp}] Simulando jornada operacional do projeto '{project['name']}'"]
+        items = self.workflow_operational_stages
         if not items:
-            logs.append("Nenhum node executável encontrado.")
+            logs.append("Nenhuma etapa operacional cadastrada.")
             self.workflow_logs = logs
-            self.toast_message = "Workflow sem nodes executáveis"
+            self.toast_message = "Jornada sem etapas configuradas"
             self.toast_type = "error"
             return
 
-        for node in items:
-            config = node.get("config", {})
-            method = config.get("method", "-")
-            endpoint = config.get("endpoint", "")
-            condition = str(config.get("condition", "")).strip()
-            output_key = str(config.get("output_key", "")).strip()
-            if node["box_type"] == "trigger":
-                schedule = config.get("schedule", "sem agenda")
-                logs.append(f"Trigger '{node['title']}' armado com schedule {schedule}")
-                continue
-            if condition:
-                logs.append(f"Condicao avaliada em '{node['title']}': {condition}")
-            if endpoint:
-                logs.append(f"Node '{node['title']}' executado: {method} {endpoint}")
-            else:
-                logs.append(f"Node '{node['title']}' executado em modo interno ({node['box_type']})")
-            if node["box_type"] == "analise":
-                logs.append("Análise IA concluída: recomendação preliminar gerada.")
-            if output_key:
-                logs.append(f"Saida publicada no contexto como '{output_key}'.")
+        for stage in items:
+            logs.append(
+                f"[{stage['context']}] {stage['title']} | Responsavel: {stage['owner']}"
+            )
+            logs.append(f"Objetivo: {stage['objective']}")
+            logs.append(f"Gatilho: {stage['trigger']}")
+            logs.append(f"Entrega esperada: {stage['expected_output']}")
+            if stage["box_type"] == "analise":
+                logs.append("Leitura analitica concluida: diagnostico preliminar preparado.")
+            if stage["title"].casefold().startswith("plano de acao"):
+                logs.append(f"Planos de acao vinculados ao projeto: {len(self.action_plans_data)} item(ns).")
 
-        logs.append("Execução finalizada com sucesso.")
+        logs.append("Simulacao finalizada com sucesso.")
         self.workflow_logs = logs
-        self.toast_message = "Execução do workflow concluída"
+        self.toast_message = "Jornada operacional simulada"
         self.toast_type = "success"
 
     def create_action_plan(self):
-        if not self.selected_project_id:
+        if not self.selected_project_id or not self.selected_project_id.isdigit():
             self.toast_message = "Selecione um projeto"
             self.toast_type = "error"
             return
-        if not self.new_action_title or not self.new_action_owner:
+        action_title = self.new_action_title.strip()
+        action_owner = self.new_action_owner.strip()
+        if not action_title or not action_owner:
             self.toast_message = "Título e responsável são obrigatórios"
             self.toast_type = "error"
             return
+        start_date = self.new_action_start_date.strip() or _now_brasilia().strftime("%Y-%m-%d")
+        planned_due_date = self.new_action_planned_due_date.strip() or self.new_action_due_date.strip()
+        due_date = self.new_action_due_date.strip() or planned_due_date
+        if not planned_due_date:
+            self.toast_message = "Informe pelo menos o prazo base do plano"
+            self.toast_type = "error"
+            return
+        attainment = 0
         session = SessionLocal()
-        action_title = self.new_action_title
+        target_tenant = self.selected_project_source_tenant
         project_row = (
             session.query(ProjectModel)
-            .filter(ProjectModel.id == int(self.selected_project_id), ProjectModel.tenant_id == self.selected_project_source_tenant)
+            .filter(ProjectModel.id == int(self.selected_project_id), ProjectModel.tenant_id == target_tenant)
             .first()
         )
-        session.add(
-            ActionPlanModel(
-                tenant_id=self.selected_project_source_tenant,
+        if not project_row:
+            session.close()
+            self.toast_message = "Projeto não encontrado para salvar o plano"
+            self.toast_type = "error"
+            return
+        if self.editing_action_plan_id.isdigit():
+            action_row = (
+                session.query(ActionPlanModel)
+                .filter(ActionPlanModel.id == int(self.editing_action_plan_id))
+                .first()
+            )
+            if not action_row:
+                session.close()
+                self.toast_message = "Plano nao encontrado para edicao"
+                self.toast_type = "error"
+                return
+            action_row.client_id = int(project_row.client_id) if project_row and project_row.client_id is not None else None
+            action_row.service_name = project_row.service_name if project_row else self.selected_project_record["service_name"]
+            action_row.dimension_names = ", ".join(self.new_action_dimension_ids) or self.new_action_dimensions.strip()
+            action_row.target_area = self.new_action_area.strip()
+            action_row.title = action_title
+            action_row.owner = action_owner
+            action_row.start_date = start_date
+            action_row.planned_due_date = planned_due_date
+            action_row.due_date = due_date
+            action_row.expected_result = self.new_action_expected_result.strip()
+            action_row.attainment = attainment
+            action_id = int(action_row.id)
+        else:
+            action_row = ActionPlanModel(
+                tenant_id=target_tenant,
                 project_id=int(self.selected_project_id),
                 client_id=int(project_row.client_id) if project_row and project_row.client_id is not None else None,
                 service_name=(project_row.service_name if project_row else self.selected_project_record["service_name"]),
-                dimension_names=self.new_action_dimensions.strip(),
+                dimension_names=", ".join(self.new_action_dimension_ids) or self.new_action_dimensions.strip(),
                 target_area=self.new_action_area.strip(),
                 title=action_title,
-                owner=self.new_action_owner,
-                due_date=self.new_action_due_date,
+                owner=action_owner,
+                start_date=start_date,
+                planned_due_date=planned_due_date,
+                due_date=due_date,
+                due_date_change_count=0,
                 status="a_fazer",
-                expected_result=self.new_action_expected_result,
-                attainment=0,
+                expected_result=self.new_action_expected_result.strip(),
+                attainment=attainment,
             )
-        )
+            session.add(action_row)
+            session.flush()
+            action_id = int(action_row.id)
         session.commit()
         session.close()
+        self.selected_action_plan_id = str(action_id)
+        self.editing_action_plan_id = ""
         self.new_action_title = ""
         self.new_action_owner = ""
+        self.new_action_start_date = ""
+        self.new_action_planned_due_date = ""
         self.new_action_due_date = ""
         self.new_action_expected_result = ""
         self.new_action_dimensions = ""
         self.new_action_area = ""
+        self.new_action_dimension_ids = []
+        self.reset_action_task_form()
         self._append_audit_entry("action.create", f"Ação criada: {action_title}", "operations")
-        self.toast_message = "Ação criada"
+        self.toast_message = "Plano salvo"
+        self.toast_type = "success"
+
+    def delete_action_plan(self, action_id: int):
+        session = SessionLocal()
+        row = (
+            session.query(ActionPlanModel)
+            .filter(ActionPlanModel.id == int(action_id))
+            .first()
+        )
+        if not row:
+            session.close()
+            self.toast_message = "Plano nao encontrado"
+            self.toast_type = "error"
+            return
+        session.query(ActionTaskModel).filter(
+            ActionTaskModel.tenant_id == row.tenant_id,
+            ActionTaskModel.action_plan_id == int(action_id),
+        ).delete()
+        session.delete(row)
+        session.commit()
+        session.close()
+        if self.selected_action_plan_id == str(action_id) or self.editing_action_plan_id == str(action_id):
+            self.cancel_edit_action_plan()
+        self.toast_message = "Plano excluido"
         self.toast_type = "success"
 
     def move_action_status(self, action_id: int, status: str):
         session = SessionLocal()
         row = (
             session.query(ActionPlanModel)
-            .filter(ActionPlanModel.id == action_id, ActionPlanModel.tenant_id == self.current_tenant)
+            .filter(ActionPlanModel.id == action_id, ActionPlanModel.tenant_id == self.selected_project_source_tenant)
             .first()
         )
         if not row:
@@ -6574,12 +8965,144 @@ class State(SessionStateMixin):
         if status == "concluido" and row.attainment < 100:
             row.attainment = 100
             row.actual_result = row.actual_result or "Concluído conforme planejado."
+        if status == "concluido":
+            row.completed_at = row.completed_at or _now_brasilia().strftime("%Y-%m-%d")
         action_title = row.title
         session.commit()
         session.close()
         self._append_audit_entry("action.status", f"Ação '{action_title}' movida para {status}", "operations")
         self.toast_message = "Status atualizado"
         self.toast_type = "success"
+
+    def shift_action_due_date(self, action_id: int, delta_days: int):
+        session = SessionLocal()
+        row = (
+            session.query(ActionPlanModel)
+            .filter(ActionPlanModel.id == action_id, ActionPlanModel.tenant_id == self.selected_project_source_tenant)
+            .first()
+        )
+        if not row:
+            session.close()
+            return
+        base_dt = self._parse_iso_date(row.due_date or row.planned_due_date or "")
+        if not base_dt:
+            session.close()
+            self.toast_message = "Plano sem data final para ajustar"
+            self.toast_type = "error"
+            return
+        new_due = base_dt + timedelta(days=int(delta_days))
+        row.due_date = new_due.strftime("%Y-%m-%d")
+        row.due_date_change_count = int(row.due_date_change_count or 0) + 1
+        session.commit()
+        session.close()
+        self.toast_message = "Prazo atualizado"
+        self.toast_type = "success"
+
+    def shift_action_task_due_date(self, task_id: int, delta_days: int):
+        session = SessionLocal()
+        row = (
+            session.query(ActionTaskModel)
+            .filter(
+                ActionTaskModel.tenant_id == self.selected_project_source_tenant,
+                ActionTaskModel.id == int(task_id),
+            )
+            .first()
+        )
+        if not row:
+            session.close()
+            return
+        base_dt = self._parse_iso_date(row.due_date or row.planned_due_date or "")
+        if not base_dt:
+            session.close()
+            self.toast_message = "Tarefa sem data final para ajustar"
+            self.toast_type = "error"
+            return
+        new_due = base_dt + timedelta(days=int(delta_days))
+        row.due_date = new_due.strftime("%Y-%m-%d")
+        row.due_date_change_count = int(row.due_date_change_count or 0) + 1
+        session.commit()
+        session.close()
+        self.toast_message = "Prazo da tarefa atualizado"
+        self.toast_type = "success"
+
+    def update_action_task_progress(self, action_id: int, task_id: int, new_progress: int):
+        session = SessionLocal()
+        action_row = (
+            session.query(ActionPlanModel)
+            .filter(ActionPlanModel.id == action_id, ActionPlanModel.tenant_id == self.selected_project_source_tenant)
+            .first()
+        )
+        if not action_row:
+            session.close()
+            return
+        task_rows = (
+            session.query(ActionTaskModel)
+            .filter(
+                ActionTaskModel.tenant_id == self.selected_project_source_tenant,
+                ActionTaskModel.action_plan_id == int(action_id),
+            )
+            .order_by(ActionTaskModel.id.asc())
+            .all()
+        )
+        tasks = [
+            {
+                "id": int(item.id),
+                "title": item.title,
+                "owner": item.owner,
+                "start_date": item.start_date or "",
+                "due_date": item.due_date or "",
+                "progress": int(item.progress or 0),
+            }
+            for item in task_rows
+        ]
+        target_index = next((idx for idx, item in enumerate(tasks) if int(item["id"]) == int(task_id)), -1)
+        if target_index < 0:
+            session.close()
+            return
+        tasks[target_index]["progress"] = max(0, min(100, int(new_progress)))
+        target_row = next((item for item in task_rows if int(item.id) == int(task_id)), None)
+        if target_row:
+            target_row.progress = int(tasks[target_index]["progress"])
+        metrics = self._action_progress_metrics(
+            action_row.start_date or "",
+            action_row.planned_due_date or "",
+            action_row.due_date or "",
+            tasks,
+            int(action_row.attainment or 0),
+            action_row.status or "a_fazer",
+            action_row.completed_at or "",
+        )
+        action_row.attainment = int(metrics["overall_progress"])
+        if tasks and all(int(item["progress"]) >= 100 for item in tasks):
+            action_row.status = "concluido"
+            action_row.completed_at = action_row.completed_at or _now_brasilia().strftime("%Y-%m-%d")
+            action_row.actual_result = action_row.actual_result or "Concluído conforme execução das tarefas."
+        elif any(int(item["progress"]) > 0 for item in tasks):
+            action_row.status = "em_andamento"
+            action_row.completed_at = ""
+        else:
+            action_row.status = "a_fazer"
+            action_row.completed_at = ""
+        session.commit()
+        session.close()
+        self.toast_message = "Progresso da tarefa atualizado"
+        self.toast_type = "success"
+
+    def adjust_action_task_progress(self, action_id: int, task_id: int, delta: int):
+        session = SessionLocal()
+        task_row = (
+            session.query(ActionTaskModel)
+            .filter(
+                ActionTaskModel.tenant_id == self.selected_project_source_tenant,
+                ActionTaskModel.action_plan_id == int(action_id),
+                ActionTaskModel.id == int(task_id),
+            )
+            .first()
+        )
+        session.close()
+        if not task_row:
+            return
+        self.update_action_task_progress(int(action_id), int(task_id), int(task_row.progress or 0) + int(delta))
 
     def add_permission_box(self, decision: str):
         if not self.perm_user_email or not self.perm_resource_name:
@@ -6759,11 +9282,11 @@ class State(SessionStateMixin):
             return
 
         knowledge_scope = self.ai_knowledge_scope_effective
-        target_tenant = "default" if knowledge_scope == "smartlab" else (self.selected_project_source_tenant if self.ai_scope_mode_effective == "projeto" else self.current_tenant)
+        target_tenant = "default" if knowledge_scope == "default" else (self.selected_project_source_tenant if self.ai_scope_mode_effective == "projeto" else self.current_tenant)
         project_scope = (
-            "smartlab"
-            if knowledge_scope == "smartlab"
-            else (self.selected_project_id if self.ai_scope_mode_effective == "projeto" and self.selected_project_id and self.selected_project_id.isdigit() else "tenant")
+            "default"
+            if knowledge_scope == "default"
+            else ("group" if knowledge_scope == "group" else (self.selected_project_id if self.ai_scope_mode_effective == "projeto" and self.selected_project_id and self.selected_project_id.isdigit() else "tenant"))
         )
         upload_dir = Path(str(rx.get_upload_dir())) / "assistant_resources" / target_tenant / str(project_scope)
         upload_dir.mkdir(parents=True, exist_ok=True)
@@ -6780,7 +9303,7 @@ class State(SessionStateMixin):
             if suffix not in allowed_suffixes:
                 unsupported_files.append(safe_name)
                 continue
-            stored_name = f"{datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{secrets.token_hex(4)}_{safe_name}"
+            stored_name = f"{_now_brasilia().strftime('%Y%m%d%H%M%S')}_{secrets.token_hex(4)}_{safe_name}"
             file_bytes = await file.read()
             stored_path = upload_dir / stored_name
             stored_path.write_bytes(file_bytes)
@@ -6789,10 +9312,10 @@ class State(SessionStateMixin):
                 tenant_id=target_tenant,
                 project_id=(
                     int(self.selected_project_id)
-                    if knowledge_scope != "smartlab" and self.ai_scope_mode_effective == "projeto" and self.selected_project_id and self.selected_project_id.isdigit()
+                    if knowledge_scope == "tenant" and self.ai_scope_mode_effective == "projeto" and self.selected_project_id and self.selected_project_id.isdigit()
                     else None
                 ),
-                knowledge_scope=knowledge_scope,
+                knowledge_scope=("default" if knowledge_scope == "default" else knowledge_scope),
                 file_name=safe_name,
                 file_path=str(stored_path),
                 resource_type=self.ai_resource_type,
@@ -6834,13 +9357,18 @@ class State(SessionStateMixin):
         if not row:
             session.close()
             return
-        if row.knowledge_scope == "smartlab" and self.user_scope != "smartlab":
+        if self._is_default_knowledge_scope(row.knowledge_scope) and self.user_scope != "smartlab":
             session.close()
-            self.toast_message = "Somente a SmartLab pode remover documentos da base mestre"
+            self.toast_message = "Somente a SmartLab pode remover documentos do workspace default"
             self.toast_type = "error"
             return
         target_tenant = self.selected_project_source_tenant if self.selected_project_id else self.current_tenant
-        if row.knowledge_scope != "smartlab" and row.tenant_id != target_tenant:
+        if str(row.knowledge_scope or "").strip().lower() == "group":
+            valid_group_tenants = self._group_tenant_ids_for_tenant(session, target_tenant)
+            if row.tenant_id not in valid_group_tenants:
+                session.close()
+                return
+        elif not self._is_default_knowledge_scope(row.knowledge_scope) and row.tenant_id != target_tenant:
             session.close()
             return
         file_path = Path(row.file_path)
@@ -6855,37 +9383,81 @@ class State(SessionStateMixin):
         self.toast_message = "Documento removido do contexto da IA"
         self.toast_type = "success"
 
-    def promote_ai_action(self, title: str, owner: str, due_date: str, expected_result: str):
-        if not self.selected_project_id or not self.selected_project_id.isdigit():
-            self.toast_message = "Selecione um projeto antes de enviar a recomendação para o Plano de Ação"
+    def send_ai_recommendation_to_plan(self, recommendation_id: str):
+        item = next((row for row in self.ai_recommendation_items if str(row.get("id")) == str(recommendation_id)), None)
+        if not item:
+            self.toast_message = "Recomendação não encontrada"
             self.toast_type = "error"
             return
+        project_id = str(item.get("project_id") or "")
+        action_plan_id = str(item.get("action_plan_id") or "")
+        if not project_id.isdigit():
+            self.toast_message = "Selecione o projeto de destino"
+            self.toast_type = "error"
+            return
+        if not action_plan_id.isdigit():
+            self.toast_message = "Selecione o plano de ação que receberá a tarefa"
+            self.toast_type = "error"
+            return
+        target_tenant = self._project_source_tenant_by_id(project_id)
         session = SessionLocal()
         project_row = (
             session.query(ProjectModel)
-            .filter(ProjectModel.id == int(self.selected_project_id), ProjectModel.tenant_id == self.selected_project_source_tenant)
+            .filter(ProjectModel.id == int(project_id), ProjectModel.tenant_id == target_tenant)
             .first()
         )
+        plan_row = (
+            session.query(ActionPlanModel)
+            .filter(
+                ActionPlanModel.id == int(action_plan_id),
+                ActionPlanModel.project_id == int(project_id),
+                ActionPlanModel.tenant_id == target_tenant,
+            )
+            .first()
+        )
+        if not project_row or not plan_row:
+            session.close()
+            self.toast_message = "Projeto ou plano de ação inválido para esta recomendação"
+            self.toast_type = "error"
+            return
+        owner = str(item.get("owner") or "").strip() or "Consultoria SmartLab"
+        due_date = str(item.get("due_date") or "").strip()
+        start_date = _format_display_date(_now_brasilia())
+        plan_title = str(plan_row.title or "Plano")
         session.add(
-            ActionPlanModel(
-                tenant_id=self.selected_project_source_tenant,
-                project_id=int(self.selected_project_id),
-                client_id=int(project_row.client_id) if project_row and project_row.client_id is not None else None,
-                service_name=(project_row.service_name if project_row else self.selected_project_record["service_name"]),
-                dimension_names="",
-                target_area="",
-                title=title,
-                owner=owner or "Consultoria SmartLab",
+            ActionTaskModel(
+                tenant_id=target_tenant,
+                action_plan_id=int(action_plan_id),
+                title=str(item.get("title") or "").strip() or "Tarefa da IA",
+                owner=owner,
+                start_date=start_date,
+                planned_due_date=due_date,
                 due_date=due_date,
-                status="a_fazer",
-                expected_result=expected_result,
-                attainment=0,
+                due_date_change_count=0,
+                expected_result=str(item.get("expected_result") or "").strip(),
+                progress=0,
             )
         )
+        if str(plan_row.status or "").strip().lower() == "concluido":
+            plan_row.status = "a_fazer"
+            plan_row.completed_at = ""
+        db_id = str(item.get("db_id") or "")
+        if db_id.isdigit():
+            recommendation_row = session.query(AssistantRecommendationModel).filter(AssistantRecommendationModel.id == int(db_id)).first()
+            if recommendation_row:
+                recommendation_row.status = "sent"
         session.commit()
         session.close()
-        self._append_audit_entry("assistant.action.promote", f"Recomendação enviada ao plano: {title}", "assistant")
-        self.toast_message = "Recomendação enviada ao Plano de Ação"
+        self.ai_recommendation_items = [row for row in self.ai_recommendation_items if str(row.get("id")) != str(recommendation_id)]
+        self.ai_recommendation_editing_id = ""
+        self.ai_recommendation_sending_id = ""
+        self._append_audit_entry(
+            "assistant.task.promote",
+            f"Recomendação enviada como tarefa para o plano {plan_title}",
+            "assistant",
+            {"project_id": project_id, "action_plan_id": action_plan_id, "title": str(item.get("title") or "")},
+        )
+        self.toast_message = "Recomendação enviada como tarefa para o plano selecionado"
         self.toast_type = "success"
 
     def ask_ai(self):
@@ -6894,6 +9466,7 @@ class State(SessionStateMixin):
             self.toast_message = "Escreva uma pergunta ou objetivo para o Especialista IA"
             self.toast_type = "error"
             return
+        should_generate_recommendations = self._prompt_requests_ai_recommendation(prompt)
 
         rows = self.dashboard_table
         avg = round(sum(float(r["media"]) for r in rows) / len(rows), 2) if rows else 0.0
@@ -6925,7 +9498,7 @@ class State(SessionStateMixin):
             self.ai_answer = factual_answer
             self.ai_history = self.ai_history + [
                 {
-                    "asked_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                    "asked_at": _format_display_datetime(_now_brasilia(), include_seconds=True),
                     "question": prompt,
                     "answer": factual_answer,
                     "model": "banco_local",
@@ -6946,6 +9519,8 @@ class State(SessionStateMixin):
                     "sources": rag_sources,
                 },
             )
+            if should_generate_recommendations:
+                self.create_ai_recommendations_from_prompt(prompt, answer)
             self.toast_message = "Resposta factual gerada diretamente do banco"
             self.toast_type = "success"
             return
@@ -6953,9 +9528,11 @@ class State(SessionStateMixin):
             "Você é o Especialista IA interno da SmartLab, rodando localmente e sem usar dados fora da plataforma.\n"
             "Nunca misture tenants. Responda apenas com base no contexto abaixo.\n\n"
             f"Tenant ativo: {context['tenant']}\n"
+            f"Tenants do grupo visíveis: {context['group_tenants']}\n"
             f"Projeto selecionado: {self.selected_project_option or 'não selecionado'}\n"
             f"Documentos disponíveis: {context['documents']}\n"
-            f"Base SmartLab disponível: {context['smartlab_documents']}\n"
+            f"Base de grupo disponível: {context['group_documents']}\n"
+            f"Workspace default disponível: {context['default_documents']}\n"
             f"Chunks RAG disponíveis: {context['chunks']}\n"
             f"Documentos do tenant/projeto: {context['tenant_documents']}\n"
             f"Formulários ativos: {context['forms']}\n"
@@ -6963,6 +9540,7 @@ class State(SessionStateMixin):
             f"Respostas vinculadas: {context['responses']}\n"
             f"Respondentes identificados: {respondent_summary}\n"
             f"Empresas identificadas: {company_summary}\n"
+            f"Diagnóstico por dimensões: {json.dumps(insights.get('dimension_breakdown', []), ensure_ascii=False)}\n"
             f"Ações em aberto: {context['actions_open']}\n"
             f"Média geral do dashboard: {avg}\n"
             f"Principais alertas: {risk_summary}\n"
@@ -6973,10 +9551,14 @@ class State(SessionStateMixin):
             f"{prompt}\n\n"
             "Entregue uma resposta objetiva com:\n"
             "1. leitura executiva;\n"
-            "2. lacunas prováveis entre respostas e políticas;\n"
-            "3. ações priorizadas;\n"
-            "4. riscos de governança se faltar evidência documental.\n"
-            "5. cite as fontes usadas pelo nome do arquivo.\n"
+            "2. análise por dimensões usando escala 0 a 5, onde 0 é nada aderente e 5 é totalmente aderente;\n"
+            "3. lacunas prováveis entre respostas e políticas;\n"
+            "4. ações priorizadas;\n"
+            "5. riscos de governança se faltar evidência documental.\n"
+            "6. cite as fontes usadas pelo nome do arquivo.\n"
+            "Se o usuário pedir recomendação, tarefa ou plano de ação, acrescente ao final um bloco JSON válido cercado por ```json com o formato:\n"
+            '{"recommendations":[{"title":"...","owner":"...","due_date":"DD-MM-YYYY","expected_result":"..."}]}\n'
+            "Não invente chaves fora desse formato.\n"
         )
 
         model_name = self.ai_selected_model_effective
@@ -6987,7 +9569,7 @@ class State(SessionStateMixin):
         if answer:
             self.ai_history = self.ai_history + [
                 {
-                    "asked_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                    "asked_at": _format_display_datetime(_now_brasilia(), include_seconds=True),
                     "question": prompt,
                     "answer": answer,
                     "model": model_name,
@@ -7009,6 +9591,8 @@ class State(SessionStateMixin):
                     "sources": rag_sources,
                 },
             )
+            if should_generate_recommendations:
+                self.create_ai_recommendations_from_prompt(prompt, self.ai_answer)
             self.toast_message = f"Resposta gerada com {model_name}"
             self.toast_type = "success"
             return
@@ -7033,25 +9617,29 @@ class State(SessionStateMixin):
                 f"{breakdown}"
             )
         else:
-            recommendation = [
-            "Leitura executiva: concentre a análise nas dimensões com maior fricção entre segurança e produtividade.",
-            "Lacunas prováveis: valide se as respostas críticas possuem política, procedimento e evidência anexada no mesmo tenant.",
-            "Ações priorizadas: converta cada achado crítico em ação 30-60-90 com responsável, prazo e evidência esperada.",
-            "Governança: não promova conclusão sem documento de suporte e mantenha o contexto isolado por tenant/projeto.",
-            ]
-            self.ai_answer = (
-                "Especialista IA SSecur1\n"
-                f"Modo local preparado, mas sem resposta do runtime {model_name}.\n"
-                f"Tenant: {context['tenant']} | Projeto: {self.selected_project_option or '-'}\n"
-                f"Média geral atual: {avg}\n"
-                f"Fontes: {context['documents']} documentos, {context['chunks']} chunks RAG, {insights['total_responses']} respostas, {context['actions_open']} ações abertas.\n"
-                f"RAG: {rag_sources}.\n"
-                f"Respondentes: {respondent_summary}.\n"
-                f"Resumo: {' '.join(recommendation)}"
-            )
+            detailed_fallback = self._build_ai_dimension_analysis_answer(prompt, insights, context, rag_sources)
+            if detailed_fallback:
+                self.ai_answer = detailed_fallback
+            else:
+                recommendation = [
+                    "Leitura executiva: concentre a análise nas dimensões com maior fricção entre segurança e produtividade.",
+                    "Lacunas prováveis: valide se as respostas críticas possuem política, procedimento e evidência anexada no mesmo tenant.",
+                    "Ações priorizadas: converta cada achado crítico em ação 30-60-90 com responsável, prazo e evidência esperada.",
+                    "Governança: não promova conclusão sem documento de suporte e mantenha o contexto isolado por tenant/projeto.",
+                ]
+                self.ai_answer = (
+                    "Especialista IA SSecur1\n"
+                    f"Modo local preparado, mas sem resposta do runtime {model_name}.\n"
+                    f"Tenant: {context['tenant']} | Projeto: {self.selected_project_option or '-'}\n"
+                    f"Média geral atual: {avg}\n"
+                    f"Fontes: {context['documents']} documentos, {context['chunks']} chunks RAG, {insights['total_responses']} respostas, {context['actions_open']} ações abertas.\n"
+                    f"RAG: {rag_sources}.\n"
+                    f"Respondentes: {respondent_summary}.\n"
+                    f"Resumo: {' '.join(recommendation)}"
+                )
         self.ai_history = self.ai_history + [
             {
-                "asked_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                "asked_at": _format_display_datetime(_now_brasilia(), include_seconds=True),
                 "question": prompt,
                 "answer": self.ai_answer,
                 "model": model_name,
@@ -7072,8 +9660,75 @@ class State(SessionStateMixin):
                 "sources": rag_sources,
             },
         )
+        if should_generate_recommendations:
+            self.create_ai_recommendations_from_prompt(prompt, self.ai_answer)
         self.toast_message = "Runtime local indisponível; análise heurística apresentada"
         self.toast_type = "error"
+
+    def create_ai_recommendations_from_prompt(self, prompt: str, answer: str = ""):
+        target_tenant, project_id = self._resolve_ai_target_tenant_and_project()
+        recommendations = self._extract_recommendations_from_ai_answer(answer)
+        source_mode = "answer"
+        if not recommendations:
+            source_mode = "fallback"
+            critical_rows = [row for row in self.dashboard_table if row["status"] in {"Crítico", "Moderado"}]
+            for row in critical_rows[:3]:
+                recommendations.append(
+                    {
+                        "title": f"Tratar lacunas de {row['form']}",
+                        "owner": "Liderança do processo",
+                        "due_date": _format_display_date(_now_brasilia() + timedelta(days=30)),
+                        "expected_result": f"Elevar a categoria {row['categoria']} acima de {row['media']} com base em políticas, entrevistas e evidências do tenant.",
+                    }
+                )
+        if not recommendations:
+            recommendations.append(
+                {
+                    "title": "Revisar aderência entre políticas e respostas",
+                    "owner": "Consultoria SmartLab",
+                    "due_date": _format_display_date(_now_brasilia() + timedelta(days=15)),
+                    "expected_result": "Consolidar lacunas, conflitos e ausências documentais antes da próxima rodada de entrevistas.",
+                }
+            )
+        session = SessionLocal()
+        existing_query = session.query(AssistantRecommendationModel).filter(
+            AssistantRecommendationModel.tenant_id == target_tenant,
+            AssistantRecommendationModel.status == "open",
+        )
+        if project_id is None:
+            existing_query = existing_query.filter(AssistantRecommendationModel.project_id.is_(None))
+        else:
+            existing_query = existing_query.filter(AssistantRecommendationModel.project_id == project_id)
+        for row in existing_query.all():
+            row.status = "replaced"
+        for item in recommendations:
+            session.add(
+                AssistantRecommendationModel(
+                    tenant_id=target_tenant,
+                    project_id=project_id,
+                    title=item["title"],
+                    owner=item["owner"],
+                    due_date=item["due_date"],
+                    expected_result=item["expected_result"],
+                    status="open",
+                    created_by=self.login_email.strip().lower() or "sistema",
+                )
+            )
+        session.commit()
+        session.close()
+        self.refresh_ai_recommendations()
+        self._append_audit_entry(
+            "assistant.recommendation.generate",
+            "Recomendações geradas sob demanda pelo prompt do usuário",
+            "assistant",
+            {
+                "question": prompt,
+                "tenant": target_tenant,
+                "project_id": str(project_id or ""),
+                "source_mode": source_mode,
+                "count": str(len(recommendations)),
+            },
+        )
 
 
 CARD_STYLE = {

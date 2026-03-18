@@ -1,8 +1,13 @@
 import json
 import re
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from ssecur1.db import ClientModel
+
+
+BRAZIL_TZ = ZoneInfo("America/Sao_Paulo")
 
 
 def loads_json(raw: str | None, fallback: Any) -> Any:
@@ -12,6 +17,62 @@ def loads_json(raw: str | None, fallback: Any) -> Any:
         return json.loads(raw)
     except (TypeError, json.JSONDecodeError):
         return fallback
+
+
+def now_brasilia() -> datetime:
+    return datetime.now(BRAZIL_TZ)
+
+
+def utc_naive_to_brasilia(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=ZoneInfo("UTC"))
+    return value.astimezone(BRAZIL_TZ)
+
+
+def format_display_date(value: str | datetime | None) -> str:
+    if value in {None, "", "-"}:
+        return "-"
+    if isinstance(value, datetime):
+        local_value = utc_naive_to_brasilia(value)
+        return local_value.strftime("%d-%m-%Y") if local_value else "-"
+    raw = str(value).strip()
+    if not raw:
+        return "-"
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(raw, fmt).strftime("%d-%m-%Y")
+        except ValueError:
+            continue
+    return raw
+
+
+def format_display_datetime(value: str | datetime | None, include_seconds: bool = False) -> str:
+    if value in {None, "", "-"}:
+        return "-"
+    if isinstance(value, datetime):
+        local_value = utc_naive_to_brasilia(value)
+    else:
+        raw = str(value).strip()
+        if not raw:
+            return "-"
+        parsed = None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%d-%m-%Y %H:%M:%S", "%d-%m-%Y %H:%M"):
+            try:
+                parsed = datetime.strptime(raw, fmt)
+                break
+            except ValueError:
+                continue
+        if parsed is None:
+            try:
+                parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except ValueError:
+                return raw
+        local_value = utc_naive_to_brasilia(parsed)
+    if not local_value:
+        return "-"
+    return local_value.strftime("%d-%m-%Y %H:%M:%S" if include_seconds else "%d-%m-%Y %H:%M")
 
 
 def question_payload(options_json: str | None) -> dict[str, Any]:

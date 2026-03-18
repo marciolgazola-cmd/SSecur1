@@ -914,73 +914,6 @@ def build_formularios_view(
                     class_name="panel-card data-table-card",
                     **CARD_STYLE,
                 ),
-                rx.box(
-                    rx.vstack(
-                        rx.heading("Recursos da Entrevista", color="var(--text-primary)", size="5"),
-                        rx.text(
-                            "Anexe audios, imagens ou evidencias do campo para apoiar a consolidacao posterior.",
-                            color="var(--text-muted)",
-                            font_size="0.9rem",
-                        ),
-                        rx.upload(
-                            rx.vstack(
-                                rx.icon(tag="upload", color="var(--accent-strong)", size=20),
-                                rx.text("Solte os arquivos aqui", color="var(--text-primary)"),
-                                rx.text("ou clique para abrir o seletor", color="var(--text-muted)", font_size="0.85rem"),
-                                align="center",
-                                spacing="2",
-                            ),
-                            id="resource_upload",
-                            width="100%",
-                            padding="1.2rem",
-                            border="2px dashed var(--dropzone-border)",
-                            border_radius="16px",
-                            bg="var(--dropzone-bg)",
-                            class_name="dropzone-area",
-                        ),
-                        rx.hstack(
-                            rx.button(
-                                "Enviar Arquivos",
-                                on_click=State.handle_resource_upload(rx.upload_files(upload_id="resource_upload")),
-                                class_name="primary-soft-action",
-                            ),
-                            rx.button(
-                                "Limpar Selecao",
-                                on_click=rx.clear_selected_files("resource_upload"),
-                                variant="ghost",
-                                border="1px solid var(--input-border)",
-                                color="var(--text-secondary)",
-                            ),
-                            spacing="3",
-                        ),
-                        rx.vstack(
-                            rx.text("Selecionados:", color="var(--text-muted)", font_size="0.82rem"),
-                            rx.foreach(
-                                rx.selected_files("resource_upload"),
-                                lambda file_name: rx.text(file_name, color="var(--text-secondary)", font_size="0.85rem"),
-                            ),
-                            align="start",
-                            width="100%",
-                            spacing="1",
-                        ),
-                        rx.vstack(
-                            rx.text("Enviados:", color="var(--text-muted)", font_size="0.82rem"),
-                            rx.foreach(
-                                State.uploaded_resources,
-                                lambda file_name: rx.text(file_name, color="var(--text-secondary)", font_size="0.85rem"),
-                            ),
-                            align="start",
-                            width="100%",
-                            spacing="1",
-                        ),
-                        align="start",
-                        spacing="3",
-                        width="100%",
-                    ),
-                    width="100%",
-                    padding="1rem",
-                    **CARD_STYLE,
-                ),
                 width="100%",
                 spacing="4",
                 class_name="content-stack",
@@ -989,7 +922,7 @@ def build_formularios_view(
                 rx.vstack(
                     rx.heading("Acesso restrito", color="var(--text-primary)", size="5"),
                     rx.text(
-                        "A tela de Formulários agora opera o registro de entrevistas do consultor e fica restrita ao SmartLab - interno.",
+                        "A tela de Formulários agora opera o registro de entrevistas do consultor e fica restrita ao workspace default.",
                         color="var(--text-muted)",
                     ),
                     align="start",
