@@ -1,5 +1,3 @@
-reflex
+reflex==0.8.27
 sqlalchemy
 alembic
-
-reflex==0.8.27

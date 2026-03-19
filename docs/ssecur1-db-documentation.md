@@ -1,3 +1,16 @@
+# Documento Substituido
+
+Este arquivo foi substituido por [database.md](/home/marcio-gazola/SSecur1/docs/database.md), que passa a ser a referencia principal e mais completa para:
+
+- motores de banco usados e recomendados;
+- entidades e atributos;
+- PK, FK e relacionamentos;
+- campos JSON serializados;
+- comportamento de recriacao do `ssecur1.db`;
+- exemplos reais de dados armazenados.
+
+O conteudo historico abaixo foi mantido apenas como registro da analise anterior.
+
 # Documentacao Tecnica do Banco `ssecur1.db`
 
 Data da analise: 2026-03-13

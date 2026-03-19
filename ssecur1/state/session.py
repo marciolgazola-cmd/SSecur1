@@ -1,6 +1,6 @@
 import reflex as rx
 
-from ssecur1.db import SessionLocal, UserModel
+from ssecur1.db import SessionLocal, UserModel, hash_password, password_needs_rehash, verify_password
 from ssecur1.utils import loads_json as _loads_json
 
 
@@ -341,16 +341,17 @@ class SessionStateMixin(rx.State):
 
     def login(self):
         session = SessionLocal()
-        user = (
-            session.query(UserModel)
-            .filter(UserModel.email == self.login_email.strip().lower(), UserModel.password == self.login_password)
-            .first()
-        )
+        user = session.query(UserModel).filter(UserModel.email == self.login_email.strip().lower()).first()
+        if user and not verify_password(self.login_password, str(user.password or "")):
+            user = None
         if not user:
             self.toast_message = "Credenciais inválidas"
             self.toast_type = "error"
             session.close()
             return
+        if password_needs_rehash(str(user.password or "")):
+            user.password = hash_password(self.login_password)
+            session.commit()
         self.is_logged = True
         self.user_role = user.role
         self.user_scope = user.account_scope or "smartlab"
@@ -359,6 +360,12 @@ class SessionStateMixin(rx.State):
         self.home_tenant_id = user.tenant_id
         self.current_tenant = user.tenant_id
         self.hydrate_tenant_context()
+        if hasattr(self, "ai_history"):
+            self.ai_history = []
+        if hasattr(self, "ai_answer"):
+            self.ai_answer = ""
+        if hasattr(self, "ai_prompt"):
+            self.ai_prompt = ""
         if self.user_role == "sem_acesso":
             self.active_view = "dashboard"
         self.force_password_reset_required = int(user.must_change_password or 0) == 1
@@ -397,7 +404,7 @@ class SessionStateMixin(rx.State):
             self.toast_type = "error"
             session.close()
             return
-        user.password = self.first_access_new_password
+        user.password = hash_password(self.first_access_new_password)
         user.must_change_password = 0
         session.commit()
         session.close()
@@ -424,7 +431,7 @@ class SessionStateMixin(rx.State):
             UserModel(
                 name=self.register_name,
                 email=self.register_email.strip().lower(),
-                password=self.register_password,
+                password=hash_password(self.register_password),
                 role="sem_acesso",
                 tenant_id=self.current_tenant,
             )
@@ -451,6 +458,12 @@ class SessionStateMixin(rx.State):
         self.selected_interview_id = ""
         self.interview_answer_map = {}
         self.interview_score_map = {}
+        if hasattr(self, "ai_history"):
+            self.ai_history = []
+        if hasattr(self, "ai_answer"):
+            self.ai_answer = ""
+        if hasattr(self, "ai_prompt"):
+            self.ai_prompt = ""
         self.active_view = "dashboard"
         audit_logger = getattr(self, "_append_audit_entry", None)
         if callable(audit_logger):

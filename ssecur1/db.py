@@ -1,5 +1,9 @@
 import json
+import os
+import hashlib
+import hmac
 from datetime import datetime
+from pathlib import Path
 
 from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text, create_engine
 from sqlalchemy.exc import OperationalError
@@ -7,9 +11,50 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, sessionmaker
 
 Base = declarative_base()
-DATABASE_URL = "sqlite:///ssecur1.db"
+
+
+def _resolve_database_url() -> str:
+    env_url = str(os.getenv("SSECUR1_DATABASE_URL", "")).strip()
+    if env_url:
+        return env_url
+    data_dir = str(os.getenv("SSECUR1_DATA_DIR", "")).strip()
+    if data_dir:
+        db_path = Path(data_dir).expanduser().resolve() / "ssecur1.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        return f"sqlite:///{db_path}"
+    return "sqlite:///ssecur1.db"
+
+
+DATABASE_URL = _resolve_database_url()
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+def hash_password(raw_password: str) -> str:
+    password = str(raw_password or "")
+    salt = os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000)
+    return f"pbkdf2_sha256$200000${salt.hex()}${digest.hex()}"
+
+
+def verify_password(raw_password: str, stored_password: str) -> bool:
+    candidate = str(raw_password or "")
+    stored = str(stored_password or "")
+    if not stored.startswith("pbkdf2_sha256$"):
+        return hmac.compare_digest(stored, candidate)
+    try:
+        _, iterations_raw, salt_hex, digest_hex = stored.split("$", 3)
+        iterations = int(iterations_raw)
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(digest_hex)
+    except (ValueError, TypeError):
+        return False
+    computed = hashlib.pbkdf2_hmac("sha256", candidate.encode("utf-8"), salt, iterations)
+    return hmac.compare_digest(expected, computed)
+
+
+def password_needs_rehash(stored_password: str) -> bool:
+    return not str(stored_password or "").startswith("pbkdf2_sha256$")
 
 
 class TenantModel(Base):
@@ -285,6 +330,37 @@ class AssistantRecommendationModel(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class AssistantConversationModel(Base):
+    __tablename__ = "assistant_conversations"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
+    user_email = Column(String, nullable=False)
+    scope_mode = Column(String, default="tenant")
+    title = Column(String, default="")
+    status = Column(String, default="active")
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow)
+
+
+class AssistantMessageModel(Base):
+    __tablename__ = "assistant_messages"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    conversation_id = Column(Integer, ForeignKey("assistant_conversations.id"), nullable=False)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
+    user_email = Column(String, nullable=False)
+    role = Column(String, nullable=False)
+    content = Column(Text, nullable=False)
+    model_name = Column(String, default="")
+    prompt_mode = Column(String, default="")
+    answer_mode = Column(String, default="")
+    sources = Column(Text, default="")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 class CustomOptionModel(Base):
     __tablename__ = "custom_options"
 
@@ -336,7 +412,7 @@ def _seed() -> None:
             UserModel(
                 name="Admin SmartLab",
                 email="admin@smartlab.com",
-                password="admin123",
+                password=hash_password("admin123"),
                 role="admin",
                 account_scope="smartlab",
                 tenant_id="default",

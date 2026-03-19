@@ -44,6 +44,26 @@ export NPM_CONFIG_CACHE="$PWD/.npm-cache"
 python -m reflex run --frontend-port 3010 --backend-port 8010
 ```
 
+### Rodar como servidor local no Ubuntu para acesso de outras pessoas
+
+Se a sua maquina Ubuntu ficar como host central da aplicacao:
+
+```bash
+mkdir -p ~/smartlab-ssecur1-data
+export SSECUR1_DATA_DIR=~/smartlab-ssecur1-data
+export HOST=0.0.0.0
+export FRONTEND_PORT=3010
+export BACKEND_PORT=8010
+./run_reflex.sh
+```
+
+Observacoes:
+
+- isso deixa o banco `ssecur1.db` fora da pasta do codigo;
+- o banco passa a ficar em `~/smartlab-ssecur1-data/ssecur1.db`;
+- os notebooks acessam a aplicacao pelo IP da maquina Ubuntu, por exemplo `http://IP_DO_SERVIDOR:3010`;
+- use `OneDrive` apenas para backup/exportacao, nao para abrir o `.db` ativo.
+
 ## 4) Exportar build web
 
 ```bash
@@ -78,3 +98,14 @@ pyinstaller pyinstaller.spec
 - Papel: `admin`
 
 Banco local SQLite: `ssecur1.db`.
+
+## Documentacao complementar
+
+- `docs/overview.md`
+- `docs/setup.md`
+- `docs/deploy.md`
+- `docs/operacao-fase1-ubuntu.md`
+- `docs/security.md`
+- `docs/technical-assessment.md`
+- `docs/code-architecture.md`
+- `docs/database.md`

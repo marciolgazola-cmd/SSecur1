@@ -10,6 +10,7 @@ mkdir -p "$NPM_CONFIG_CACHE"
 
 FRONTEND_PORT="${FRONTEND_PORT:-3010}"
 BACKEND_PORT="${BACKEND_PORT:-8010}"
+HOST="${HOST:-0.0.0.0}"
 
 kill_port_listeners() {
   local port="$1"
@@ -31,4 +32,4 @@ kill_port_listeners() {
 kill_port_listeners "$FRONTEND_PORT"
 kill_port_listeners "$BACKEND_PORT"
 
-python -m reflex run --frontend-port "$FRONTEND_PORT" --backend-port "$BACKEND_PORT"
+python -m reflex run --frontend-port "$FRONTEND_PORT" --backend-port "$BACKEND_PORT" --backend-host "$HOST"
